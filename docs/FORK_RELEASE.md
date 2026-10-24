@@ -1,12 +1,18 @@
-# `carcot/skhd.zig` app-scoped remap build
+# skhd+ app-scoped remap build
 
 This fork extends the upstream skhd grabber with exact-bundle-ID app guards
 for tap/hold rules and app-specific `passthrough`. It also ports the virtual
 keyboard connection to Karabiner DriverKit 8.5's stream protocol, forwards
 frontmost-app changes from the agent, selects one rule per key/device/app, and
 reconnects and reapplies rules when the grabber connection drops. See the
-[README](../README.md#this-fork-app-specific-low-level-remaps) for an example
+[README](../README.md#app-specific-low-level-remaps) for an example
 and [the design/test record](APP_SCOPED_REMAPS.md) for details.
+
+The public repository is [`carcot/skhd-plus`](https://github.com/carcot/skhd-plus).
+It is a fork of `jackielii/skhd.zig`, not the source of upstream's Homebrew
+cask. The app and command names remain `skhd` to preserve the current macOS
+permission and launchd identities. The published fork ZIP is linked from
+[the release page](https://github.com/carcot/skhd-plus/releases/tag/appscope-0.2.1.1).
 
 ## What the app bundle contains
 

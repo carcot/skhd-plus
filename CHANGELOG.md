@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased](https://github.com/carcot/skhd.zig/compare/v0.2.0...main)
+## [Unreleased](https://github.com/carcot/skhd-plus/compare/appscope-0.2.1.1...main)
 
 ### Added
 - Experimental exact-bundle-ID app guards for device-scoped tap/hold rules, including an app-specific `passthrough` override and one selected rule per key/device/app.
@@ -15,6 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - Ported virtual-keyboard transport to Karabiner DriverKit 8.5's stream protocol; updated the pinned DriverKit version and tightened keyboard-capture failure recovery.
 - Added fork-specific setup, guarded-test, and local rollback documentation. The app-scoped feature remains opt-in and is not enabled by the ordinary service installer.
+- Renamed the public fork to skhd+ and separated fork release instructions from upstream Homebrew and CI instructions; runtime identifiers and the published release artifact are unchanged.
 
 ## [0.2.0](https://github.com/jackielii/skhd.zig/compare/v0.1.11...v0.2.0) - 2026-07-20
 

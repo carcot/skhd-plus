@@ -1,12 +1,12 @@
-# SKHD in Zig
+# skhd+
 
-Simple Hotkey Daemon for macOS, ported from [skhd](https://github.com/koekeishiya/skhd) to Zig.
+An experimental fork of [skhd.zig](https://github.com/jackielii/skhd.zig), the Zig port of the original [skhd](https://github.com/asmvik/skhd) for macOS. The public name is **skhd+**; the executable, app bundle, configuration format, and macOS service identifiers remain `skhd` for compatibility.
 
 This implementation is **fully compatible with the original skhd configuration format** - your existing `.skhdrc` files will work without modification. Additionally, it includes new features like process groups and command definitions (`.define`) for cleaner configs, key forwarding/remapping, and improved error reporting.
 
 📋 [View Changelog](CHANGELOG.md)
 
-## This fork: app-specific low-level remaps
+## App-specific low-level remaps
 
 The `carcot` fork adds **per-application tap/hold remapping** to the
 system-level grabber. Rules select the frontmost app by its exact macOS bundle
@@ -39,8 +39,7 @@ run with `--experimental-app-scoped-rules` on a separate `--socket-path`, and
 the agent must use that socket with `--grabber-socket`. A plain
 `skhd --install-service` does not enable this feature. The bundled app contains
 both binaries; see [fork setup and limitations](docs/FORK_RELEASE.md) before
-installing it. This fork still depends on the Karabiner DriverKit virtual-HID
-component, though Karabiner's keyboard-owning user agents can be disabled.
+installing it. The [Apple Silicon ReleaseSafe pre-release](https://github.com/carcot/skhd-plus/releases/tag/appscope-0.2.1.1) is signed with an Apple Development certificate, not notarized, and has not had a physical-keyboard test. This fork still depends on the Karabiner DriverKit virtual-HID component, though Karabiner's keyboard-owning user agents can be disabled.
 
 ## v0.2.0 — Hotkey sequences
 
@@ -73,23 +72,7 @@ skhd.zig now ships a system-level **grabber daemon** that enables remapping the 
 - **Layer holds** — `hold` can target a skhd mode instead of a key, so holding the source key activates the layer for the duration of the hold (e.g. hold `space` to enter `fn_layer`, where `fn_layer < 1 | f1` rebinds the number row to F-keys).
 - **`.device <alias> { vendor: 0x…, product: 0x… }`** — scope rules to a specific keyboard, so one config does the right thing on each machine.
 
-**Install** via Homebrew, or download the `.app` bundle from GitHub releases:
-
-```bash
-brew install jackielii/tap/skhd-zig
-skhd --install-service
-```
-
-Or, manual install:
-
-```bash
-gh release download v0.1.0 --repo jackielii/skhd.zig --pattern '*-arm64-macos.tar.gz'
-tar -xzf skhd-arm64-macos.tar.gz -C /tmp
-sudo mv /tmp/skhd.app /Applications/
-/Applications/skhd.app/Contents/MacOS/skhd --install-service
-```
-
-`--install-service` registers the agent, auto-installs the Karabiner DriverKit pkg if your config has tap-hold rules, prompts for the grabber install via sudo, and pops Accessibility + Input Monitoring dialogs in sequence — one click each.
+These are inherited upstream features. For this fork's artifact and its different activation requirements, use [Installation](#installation) and [fork setup and limitations](docs/FORK_RELEASE.md), not an upstream Homebrew command.
 
 **Try it out** — drop this into `~/.config/skhd/skhdrc` (replace the vendor/product IDs with your own — find them via `skhd --grabber-status` once installed, or System Information → USB):
 
@@ -125,7 +108,7 @@ Save, then `skhd --restart-service`. Tap `caps_lock` → escape. Hold `caps_lock
 
 **Verify** with `skhd --status` (single command shows the agent, grabber, dext, and TCC state) or `skhd --grabber-status` (drills into the grabber-side dependency chain). **Roll back** with `skhd --uninstall-service` (it prints follow-up `sudo skhd --uninstall-grabber` instructions if anything's still on disk).
 
-**Larger real-world example** — my own `builtin.skhdrc`, which makes a MacBook built-in keyboard behave like a [Keebio Convolution](https://keeb.io/products/convolution-65xt-keyboard) running custom QMK firmware (caps_lock as ctrl/escape, space as fn_layer, fn_layer < hjkl as arrows, number row → F-row under layer, etc.):
+**Upstream author's real-world example** — Jackie Li's `builtin.skhdrc` makes a MacBook built-in keyboard behave like a [Keebio Convolution](https://keeb.io/products/convolution-65xt-keyboard) running custom QMK firmware (caps_lock as ctrl/escape, space as fn_layer, fn_layer < hjkl as arrows, number row → F-row under layer, etc.):
 
 - skhd config: <https://gist.github.com/jackielii/9d24095af57ec35df0d46d38bbbe0449>
 - QMK source-of-truth keymap it mirrors: <https://github.com/jackielii/qmk_firmware/blob/jackie/keyboards/keebio/convolution/keymaps/jackie/keymap.c>
@@ -134,77 +117,33 @@ See [skhd-grabber](#skhd-grabber-caps_lock-class-tap-hold) below for the full ar
 
 ## Installation
 
-### Homebrew
+### Fork pre-release
 
-The easiest way to install skhd.zig:
-
-```bash
-brew install jackielii/tap/skhd-zig
-```
-
-> Upgrading from 0.0.17 or earlier? See [docs/UPGRADING.md](docs/UPGRADING.md). The 0.0.18 release switches to an `.app` bundle to keep accessibility permissions working on macOS Tahoe; one-time re-grant is required.
-
-### Pre-built Binaries
-
-Both architectures are published (Intel is cross-compiled from the arm64 runner):
-
-- `skhd-arm64-macos.tar.gz` (Apple Silicon)
-- `skhd-x86_64-macos.tar.gz` (Intel)
-
-Extract and install (substitute the tarball for your arch):
+The only published fork artifact is the [Apple Silicon ReleaseSafe `skhd.app` ZIP](https://github.com/carcot/skhd-plus/releases/tag/appscope-0.2.1.1). It includes `skhd` and `skhd-grabber`. It is **not** an Intel build, Homebrew cask, notarized installer, or automatic migration of a working keyboard setup. Download and inspect it with:
 
 ```bash
-tar -xzf skhd-arm64-macos.tar.gz   # or skhd-x86_64-macos.tar.gz on Intel
-mv skhd.app /Applications/
-# Optional: expose the CLI on your PATH
-sudo ln -sfn /Applications/skhd.app/Contents/MacOS/skhd /usr/local/bin/skhd
+gh release download appscope-0.2.1.1 --repo carcot/skhd-plus --pattern '*-arm64-ReleaseSafe.zip'
+unzip -l skhd-carcot-appscope-0.2.1.1-arm64-ReleaseSafe.zip
 ```
 
-Then grant accessibility (see [Granting Accessibility](#granting-accessibility) below).
+Do not overwrite a running `/Applications/skhd.app` or enable a second grabber just to try the ZIP. Read [fork setup and limitations](docs/FORK_RELEASE.md) and arrange a rollback before changing keyboard ownership. `skhd --install-service` alone starts the ordinary service; it does not enable the experimental app-scoped path.
 
-### Development Builds from GitHub Actions
-
-If you want a main-branch build at a specific optimization level (Debug, ReleaseSafe, ReleaseFast, ReleaseSmall), you can download one directly from GitHub Actions. These are signed `skhd.app` bundles with `skhd-grabber` included — same layout as the release tarballs, just built from `main` instead of a tag. Apple Silicon only.
-
-1. Go to the [CI workflow](https://github.com/jackielii/skhd.zig/actions/workflows/ci.yml?query=branch%3Amain) in Actions tab. Filter by branch `main`.
-2. Click on the latest successful run
-3. Scroll down to the "Artifacts" section
-4. Download the artifact for your desired optimization level:
-   - `skhd-Debug` - Debug build with full debugging symbols
-   - `skhd-ReleaseSafe` - Release build with runtime safety checks
-   - `skhd-ReleaseFast` - Optimized for performance (recommended for daily use)
-   - `skhd-ReleaseSmall` - Optimized for binary size
-
-GitHub wraps each artifact in a `.zip`. Inside is `skhd-arm64-macos.tar.gz`; extract and install the same way as a release tarball:
-
-```bash
-unzip skhd-ReleaseFast.zip
-tar -xzf skhd-arm64-macos.tar.gz
-mv skhd.app /Applications/
-sudo ln -sfn /Applications/skhd.app/Contents/MacOS/skhd /usr/local/bin/skhd
-```
-
-Then grant accessibility (see [Granting Accessibility](#granting-accessibility) below).
+For upstream's Homebrew cask, Intel archives, or normal `v*` releases, see [the upstream installation guide](https://github.com/jackielii/skhd.zig#installation). `brew install jackielii/tap/skhd-zig` installs **upstream**, not skhd+.
 
 ### Build from Source
 
 ```bash
 # Clone the repository
-git clone https://github.com/jackielii/skhd.zig
-cd skhd.zig
+git clone https://github.com/carcot/skhd-plus.git
+cd skhd-plus
 
-# Build the .app bundle and code-sign it
-# (required for Accessibility to persist on macOS Tahoe / Sequoia)
-zig build sign-app -Doptimize=ReleaseFast
-
-# Install: symlink the bundle into /Applications, expose the CLI
-ln -sfn "$(pwd)/zig-out/skhd.app" /Applications/skhd.app
-sudo ln -sfn /Applications/skhd.app/Contents/MacOS/skhd /usr/local/bin/skhd
+# Build the .app bundle (signing is a separate step)
+zig build app -Doptimize=ReleaseSafe
 ```
 
-For quick dev iteration without the bundle wrapper, `zig build` still produces a bare binary at `zig-out/bin/skhd`. The `.app` is only needed for the System Settings → Accessibility picker.
+This builds `zig-out/skhd.app` without installing or starting it. To sign the fork build, follow [the explicit signing steps](docs/FORK_RELEASE.md#reproduce-the-artifact). Do not replace a live input app without a guarded cutover.
 
-The first run of `zig build sign-app` creates a self-signed `skhd-cert` certificate in your login keychain. See [docs/CODE_SIGNING.md](docs/CODE_SIGNING.md) for details and troubleshooting.
+For quick dev iteration without the bundle wrapper, `zig build` still produces a bare binary at `zig-out/bin/skhd`. The `.app` is needed for the System Settings → Accessibility picker. See [docs/CODE_SIGNING.md](docs/CODE_SIGNING.md) for background on signing.
 
 ### Granting Accessibility
 
@@ -214,7 +153,7 @@ skhd captures keyboard events via macOS Core Graphics, which requires Accessibil
 2. Toggle the **skhd** entry on
 3. Run `skhd --restart-service` (or `skhd --start-service` if not yet running)
 
-You only need to do this once. The bundle's stable identifier (`com.jackielii.skhd`) means TCC entries persist across rebuilds and `brew upgrade`.
+The bundle identifier remains `com.jackielii.skhd` for compatibility; renaming the repository does not rename its macOS permission entry or service.
 
 If your config uses `.remap` or `.taphold` rules, macOS will additionally
 prompt you for **Input Monitoring** the first time the grabber starts.
@@ -767,7 +706,7 @@ skhd --grabber-status
 
 `skhd-grabber` requires the **Karabiner DriverKit VirtualHIDDevice**
 extension to inject HID events. The agent's install flow auto-installs
-the pinned version (currently v6.14.0; sha-256 verified) the first time
+the pinned version (currently v8.5.0; sha-256 verified) the first time
 you run `--install-service`, so most users never touch this directly.
 If you'd rather install it ahead of time:
 
@@ -959,12 +898,12 @@ log show --last 5m --predicate 'process == "skhd" OR process == "skhd-grabber"'
 
 | Build                            | `-V` shows               | `-P` profiling                  |
 |----------------------------------|--------------------------|---------------------------------|
-| ReleaseFast (Homebrew default)   | errors + warnings only   | disabled (compiled out)         |
+| ReleaseFast (upstream Homebrew default) | errors + warnings only | disabled (compiled out) |
 | ReleaseSafe                      | + info                   | available                       |
 | Debug (`zig build`)              | + debug                  | available with full traces      |
 
-Homebrew installs are ReleaseFast, so `-V` against the installed binary is
-intentionally quiet. To dig into a hotkey misbehaviour, run a Debug or
+Upstream Homebrew installs are ReleaseFast; this fork's published ZIP is
+ReleaseSafe. To dig into a hotkey misbehaviour, run a Debug or
 ReleaseSafe build directly:
 
 ```bash

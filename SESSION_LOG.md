@@ -1315,3 +1315,22 @@
   unchanged for this fork's pre-release. A manually published fork-only
   tag outside that pattern can attach a locally signed app archive without
   touching upstream or the current working keyboard apps.
+
+## 2026-10-24: skhd+ public rename and installation documentation
+
+- The fork README still offered upstream Homebrew, archive, CI, and clone
+  commands after the fork-specific release. Following those commands would
+  fetch `jackielii/skhd.zig` rather than this fork. Changed the public name
+  to skhd+, documented the actual Apple Silicon ReleaseSafe pre-release,
+  and explicitly labeled upstream installation and inherited examples.
+- Kept executable, app bundle, launchd, and TCC identifiers unchanged to
+  avoid disturbing the proven keyboard setup. The GitHub repository is
+  renamed from `carcot/skhd.zig` to `carcot/skhd-plus`; GitHub's redirects
+  preserve prior release URLs. The original ZIP filename and tag are not
+  rewritten.
+- Guarded the upstream-oriented `v*` release workflow to run only in
+  `jackielii/skhd.zig`, preventing this fork from advertising upstream
+  Homebrew or attempting to update `jackielii/homebrew-tap` on a later tag.
+- Validation: documentation code fences and relative links checked, YAML
+  parsed, `git diff --check` passed. No keyboard services or source binaries
+  changed; no physical-input test was part of this documentation-only update.

@@ -10,6 +10,7 @@ permissions:
 
 jobs:
   create-release:
+    if: github.repository == 'jackielii/skhd.zig'
     runs-on: ubuntu-latest
     outputs:
       upload_url: ${{ steps.create_release.outputs.upload_url }}
@@ -229,7 +230,7 @@ jobs:
     # via `brew upgrade`. Stable users stay on whatever the last final
     # tag was; we install pre-releases manually via `gh release download`
     # for testing.
-    if: ${{ !contains(github.ref_name, '-alpha') && !contains(github.ref_name, '-beta') && !contains(github.ref_name, '-rc') }}
+    if: ${{ github.repository == 'jackielii/skhd.zig' && !contains(github.ref_name, '-alpha') && !contains(github.ref_name, '-beta') && !contains(github.ref_name, '-rc') }}
     runs-on: ubuntu-latest
     steps:
     - name: Checkout homebrew-tap
