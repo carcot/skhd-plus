@@ -1,40 +1,7 @@
-//! Karabiner-DriverKit-VirtualHIDDevice client.
-//!
-//! Talks to the `vhidd_server` daemon shipped by pqrs.org's signed
-//! DriverKit extension. Used by the grabber to inject HID events
-//! (keyboard reports specifically — pointing/consumer reports are
-//! defined for completeness but not yet wired up).
-//!
-//! Protocol summary (verified against
-//! Karabiner-DriverKit-VirtualHIDDevice 533b4b6, July 2025):
-//!
-//! Transport
-//!     SOCK_DGRAM Unix domain. Server listens on the lexically-last
-//!     `*.sock` under `/Library/Application Support/org.pqrs/tmp/
-//!     rootonly/vhidd_server/`. Clients bind their own ephemeral
-//!     socket under `vhidd_client/<ns>.sock` so the server can use
-//!     the sender address as the per-client key (and so responses
-//!     come back via recvfrom).
-//!
-//! Outer envelope (pqrs::local_datagram::send_entry)
-//!     [type:u8] [body…]
-//!     type=0x00 → heartbeat: body = `[next_heartbeat_deadline:u32 LE]`
-//!     type=0x01 → user_data:  body = vhidd protocol bytes
-//!
-//!     The leading type byte is stripped before the application sees
-//!     a received frame.
-//!
-//! Inner protocol (virtual_hid_device_service)
-//!     Send: [magic 'c''p'] [version:u16 LE = 5] [request:u8] [payload]
-//!     Recv: [response:u8] [body…]
-//!
-//! Root-only: the server / client socket directories live under
-//! /Library/Application Support/org.pqrs/tmp/rootonly/, which is
-//! mode 0700 owned by root.
-
 const std = @import("std");
 const builtin = @import("builtin");
 const posix = std.posix;
+const Stream = @import("VhiddStream.zig");
 
 const log = std.log.scoped(.vhidd);
 
@@ -72,30 +39,20 @@ pub fn isTransportError(err: anyerror) bool {
     };
 }
 
-const protocol_version: u16 = 5;
-const magic = [_]u8{ 'c', 'p' };
-
-/// `pqrs::local_datagram::send_entry::type`.
-const FrameType = enum(u8) {
-    heartbeat = 0,
-    user_data = 1,
-};
-
 /// `pqrs::karabiner::driverkit::virtual_hid_device_service::request`.
 pub const Request = enum(u8) {
-    none = 0,
-    virtual_hid_keyboard_initialize = 1,
-    virtual_hid_keyboard_terminate = 2,
-    virtual_hid_keyboard_reset = 3,
-    virtual_hid_pointing_initialize = 4,
-    virtual_hid_pointing_terminate = 5,
-    virtual_hid_pointing_reset = 6,
-    post_keyboard_input_report = 7,
-    post_consumer_input_report = 8,
-    post_apple_vendor_keyboard_input_report = 9,
-    post_apple_vendor_top_case_input_report = 10,
-    post_generic_desktop_input_report = 11,
-    post_pointing_input_report = 12,
+    virtual_hid_keyboard_initialize = 0,
+    virtual_hid_keyboard_terminate = 1,
+    virtual_hid_keyboard_reset = 2,
+    virtual_hid_pointing_initialize = 3,
+    virtual_hid_pointing_terminate = 4,
+    virtual_hid_pointing_reset = 5,
+    post_keyboard_input_report = 6,
+    post_consumer_input_report = 7,
+    post_apple_vendor_keyboard_input_report = 8,
+    post_apple_vendor_top_case_input_report = 9,
+    post_generic_desktop_input_report = 10,
+    post_pointing_input_report = 11,
 };
 
 /// `pqrs::karabiner::driverkit::virtual_hid_device_service::response`.
@@ -108,40 +65,6 @@ pub const Response = enum(u8) {
     virtual_hid_pointing_ready = 5,
     _,
 };
-
-/// A parsed inbound datagram (outer envelope included). Used by the
-/// daemon's vhidd watchdog, which drains the socket via a runloop read
-/// source and reacts to heartbeats / status pushes as they arrive.
-pub const Frame = union(enum) {
-    /// Server heartbeat. Payload is the announced next-heartbeat
-    /// deadline in milliseconds (0 if the body was short/malformed —
-    /// callers should substitute a sane default).
-    heartbeat: u32,
-    /// Inner-protocol response with its first body byte (if any).
-    response: struct { resp: Response, body_first: ?u8 },
-    /// Empty or unrecognized frame.
-    other,
-};
-
-/// Parse one received datagram. Pure — no I/O.
-pub fn parseFrame(buf: []const u8) Frame {
-    if (buf.len == 0) return .other;
-    switch (buf[0]) {
-        @intFromEnum(FrameType.heartbeat) => {
-            if (buf.len < 5) return .{ .heartbeat = 0 };
-            return .{ .heartbeat = std.mem.readInt(u32, buf[1..5], .little) };
-        },
-        @intFromEnum(FrameType.user_data) => {
-            if (buf.len < 2) return .other;
-            return .{ .response = .{
-                // Response is non-exhaustive — any u8 is representable.
-                .resp = @enumFromInt(buf[1]),
-                .body_first = if (buf.len > 2) buf[2] else null,
-            } };
-        },
-        else => return .other,
-    }
-}
 
 /// Modifier byte layout for `keyboard_input.modifiers`. Bit values
 /// match HID Usage Page 0x07 modifier semantics.
@@ -159,90 +82,36 @@ pub const Modifier = packed struct(u8) {
 /// vhidd `virtual_hid_keyboard_parameters`. Byte-level layout matches
 /// `__attribute__((packed))` in C++ (3 × u64 LE = 24 bytes).
 pub const KeyboardParameters = struct {
-    vendor_id: u64 = 0x16c0,
-    product_id: u64 = 0x27db,
+    vendor_id: u64 = 0x05ac,
+    product_id: u64 = 0x024f,
     /// HID Usage Page 0x07 country code; 0 = "not supported".
     country_code: u64 = 0,
 };
 
-const root_dir = "/Library/Application Support/org.pqrs/tmp/rootonly";
-pub const server_socket_dir = root_dir ++ "/vhidd_server";
-pub const client_socket_dir = root_dir ++ "/vhidd_client";
-
 pub const Client = struct {
-    allocator: std.mem.Allocator,
+    socket: Stream.Socket,
     fd: posix.fd_t,
-    /// Ephemeral path we bound — needs unlink on close.
-    bound_path: []u8,
 
     pub fn connect(allocator: std.mem.Allocator, io: std.Io) !Client {
-        const server_path = try findServerSocket(allocator, io);
-        defer allocator.free(server_path);
-
-        try ensureClientDir(io);
-
-        const client_path = try ephemeralClientPath(allocator);
-        errdefer allocator.free(client_path);
-
-        // Stale file from a prior crash would make bind() fail with EADDRINUSE.
-        // libc unlink returns -1 / sets errno on failure; ENOENT is expected.
-        const path_z = try allocator.dupeZ(u8, client_path);
-        defer allocator.free(path_z);
-        const rc = std.c.unlink(path_z.ptr);
-        const ue = std.c.errno(rc);
-        if (ue != .SUCCESS and ue != .NOENT) return error.ClientSocketBindFailed;
-
-        // Darwin doesn't accept SOCK_CLOEXEC in the type bits the way Linux
-        // does — `std.c.SOCK.CLOEXEC` is a Zig-internal shim flag that the
-        // (now-removed) `std.posix.socket` wrapper used to translate into a
-        // post-creation fcntl. Calling `std.c.socket` directly we have to do
-        // that fcntl ourselves, otherwise the syscall rejects the unknown
-        // bit and returns -1.
-        const fd_rc = std.c.socket(std.c.AF.UNIX, std.c.SOCK.DGRAM, 0);
-        if (fd_rc < 0) return error.ClientSocketBindFailed;
-        const fd: posix.fd_t = fd_rc;
-        errdefer _ = std.c.close(fd);
-        _ = std.c.fcntl(fd, std.c.F.SETFD, @as(c_int, std.c.FD_CLOEXEC));
-
-        try bindUnix(fd, client_path);
-        errdefer _ = std.c.unlink(path_z.ptr);
-
-        try connectUnix(fd, server_path);
-
-        log.info("connected: server={s} client={s}", .{ server_path, client_path });
-
-        return .{
-            .allocator = allocator,
-            .fd = fd,
-            .bound_path = client_path,
-        };
+        _ = allocator;
+        _ = io;
+        const socket = try Stream.Socket.connect();
+        return .{ .socket = socket, .fd = socket.fd };
     }
 
     pub fn close(self: *Client) void {
-        _ = std.c.close(self.fd);
-        const path_z = self.allocator.dupeZ(u8, self.bound_path) catch null;
-        if (path_z) |p| {
-            defer self.allocator.free(p);
-            _ = std.c.unlink(p.ptr);
-        }
-        self.allocator.free(self.bound_path);
+        self.socket.close();
         self.* = undefined;
     }
 
     /// Send a vhidd request with no payload.
     pub fn sendRequest(self: *Client, req: Request) !void {
-        var buf: [16]u8 = undefined;
-        const n = encodeHeader(&buf, req);
-        try self.sendUserData(buf[0..n]);
+        _ = try self.socket.sendDriverRequest(@intFromEnum(req), &.{});
     }
 
     /// Send a vhidd request with a fixed-size payload appended.
     pub fn sendRequestWithPayload(self: *Client, req: Request, payload: []const u8) !void {
-        var buf: [1024]u8 = undefined;
-        const hdr_len = encodeHeader(&buf, req);
-        if (hdr_len + payload.len > buf.len) return error.PayloadTooLarge;
-        @memcpy(buf[hdr_len..][0..payload.len], payload);
-        try self.sendUserData(buf[0 .. hdr_len + payload.len]);
+        _ = try self.socket.sendDriverRequest(@intFromEnum(req), payload);
     }
 
     /// Send a `virtual_hid_keyboard_initialize` request with the given
@@ -329,71 +198,31 @@ pub const Client = struct {
             if (remaining <= 0) return error.Timeout;
 
             try setRecvTimeout(self.fd, @intCast(remaining));
-
-            var buf: [1024]u8 = undefined;
-            const n_signed = std.c.recv(self.fd, &buf, buf.len, 0);
-            if (n_signed < 0) {
-                const e = std.c.errno(n_signed);
-                if (e == .AGAIN) return error.Timeout;
-                return error.RecvFailed;
-            }
-            const n: usize = @intCast(n_signed);
-            if (n == 0) continue;
-
-            // Wire frame: [type:u8] [body…].
-            // type=0 (heartbeat) → body is `[next_heartbeat_deadline:u32 LE]`.
-            // type=1 (user_data) → body is `[response:u8] [response_body…]`.
-            const frame_type: FrameType = @enumFromInt(buf[0]);
-            switch (frame_type) {
-                .heartbeat => {
-                    log.debug("recv heartbeat ({d} body bytes)", .{n - 1});
-                    continue;
-                },
-                .user_data => {
-                    if (n < 2) continue;
-                    const resp: Response = @enumFromInt(buf[1]);
-                    const resp_body_len = n - 2;
-                    log.debug("recv response={d} body_len={d} body[0]={any}", .{
-                        buf[1],
-                        resp_body_len,
-                        if (resp_body_len > 0) @as(?u8, buf[2]) else null,
-                    });
-                    if (resp == want and resp_body_len >= 1 and buf[2] != 0) {
-                        return;
-                    }
-                    // Non-matching response (or matching but false) —
-                    // loop and read again.
-                },
+            const incoming = (try self.socket.receive(false)) orelse return error.Timeout;
+            if (incoming.message_type == .request) try self.socket.sendResponse(incoming.request_id.?);
+            if (incoming.message_type == .heartbeat) try self.socket.sendHeartbeat();
+            const payload = incoming.payload;
+            if (incoming.message_type != .request and incoming.message_type != .response) continue;
+            var offset: usize = 0;
+            while (offset + 1 < payload.len) : (offset += 2) {
+                if (payload[offset] == @intFromEnum(Response.driver_version_mismatched) and payload[offset + 1] != 0) return error.DriverVersionMismatch;
+                if (payload[offset] == @intFromEnum(want) and payload[offset + 1] != 0) return;
             }
         }
     }
 
-    fn sendUserData(self: *Client, body: []const u8) !void {
-        var buf: [1024]u8 = undefined;
-        if (body.len + 1 > buf.len) return error.PayloadTooLarge;
-        buf[0] = @intFromEnum(FrameType.user_data);
-        @memcpy(buf[1..][0..body.len], body);
-        const sent = std.c.send(self.fd, buf[0 .. body.len + 1].ptr, body.len + 1, 0);
-        if (sent < 0) return error.SendFailed;
-        if (@as(usize, @intCast(sent)) != body.len + 1) return error.ShortWrite;
+    pub fn receive(self: *Client) !?Stream.Frame {
+        return self.socket.receive(true);
+    }
+
+    pub fn sendHeartbeat(self: *Client) !void {
+        try self.socket.sendHeartbeat();
+    }
+
+    pub fn sendResponse(self: *Client, request_id: u64) !void {
+        try self.socket.sendResponse(request_id);
     }
 };
-
-fn encodeHeader(buf: []u8, req: Request) usize {
-    buf[0] = magic[0];
-    buf[1] = magic[1];
-    std.mem.writeInt(u16, buf[2..4], protocol_version, .little);
-    buf[4] = @intFromEnum(req);
-    return 5;
-}
-
-fn ensureClientDir(io: std.Io) !void {
-    std.Io.Dir.createDirAbsolute(io, client_socket_dir, .default_dir) catch |err| switch (err) {
-        error.PathAlreadyExists => {},
-        error.AccessDenied, error.PermissionDenied => return error.PermissionDenied,
-        else => return error.ClientSocketDirCreate,
-    };
-}
 
 /// `clock_gettime(REALTIME)` in milliseconds. std.time.milliTimestamp
 /// was removed in Zig 0.16.
@@ -402,77 +231,6 @@ fn nowMillis() i64 {
     _ = std.c.clock_gettime(std.c.CLOCK.REALTIME, &ts);
     return @as(i64, @intCast(ts.sec)) * std.time.ms_per_s +
         @divFloor(@as(i64, @intCast(ts.nsec)), std.time.ns_per_ms);
-}
-
-fn ephemeralClientPath(allocator: std.mem.Allocator) ![]u8 {
-    // Karabiner uses hex-formatted nanoseconds since epoch; we match
-    // that since the server doesn't care about the format, only that
-    // it's unique. Using clock_gettime directly — std.time.nanoTimestamp
-    // was removed in Zig 0.16 and the new Io.Timestamp API would require
-    // plumbing io through every caller for what's just a "unique enough"
-    // ephemeral name.
-    var ts: std.c.timespec = undefined;
-    _ = std.c.clock_gettime(std.c.CLOCK.REALTIME, &ts);
-    const ns: u128 = @as(u128, @intCast(ts.sec)) * std.time.ns_per_s + @as(u128, @intCast(ts.nsec));
-    return std.fmt.allocPrint(allocator, "{s}/{x}.sock", .{ client_socket_dir, ns });
-}
-
-/// Find the server's listening socket. Karabiner restarts produce
-/// a new file (epoch-named in hex), so we glob and pick the lexically
-/// last one — same algorithm Karabiner's own client uses.
-fn findServerSocket(allocator: std.mem.Allocator, io: std.Io) ![]u8 {
-    var dir = std.Io.Dir.openDirAbsolute(io, server_socket_dir, .{ .iterate = true }) catch |err| switch (err) {
-        error.FileNotFound => return error.ServerSocketDirMissing,
-        error.AccessDenied, error.PermissionDenied => return error.PermissionDenied,
-        else => return err,
-    };
-    defer dir.close(io);
-
-    var best: ?[]u8 = null;
-    errdefer if (best) |p| allocator.free(p);
-
-    var it = dir.iterate();
-    while (try it.next(io)) |entry| {
-        if (entry.kind != .unix_domain_socket and entry.kind != .file) continue;
-        if (!std.mem.endsWith(u8, entry.name, ".sock")) continue;
-        if (best) |existing| {
-            if (std.mem.lessThan(u8, existing, entry.name)) {
-                allocator.free(existing);
-                best = try allocator.dupe(u8, entry.name);
-            }
-        } else {
-            best = try allocator.dupe(u8, entry.name);
-        }
-    }
-
-    const name = best orelse return error.ServerSocketAbsent;
-    defer allocator.free(name);
-    return std.fmt.allocPrint(allocator, "{s}/{s}", .{ server_socket_dir, name });
-}
-
-fn bindUnix(fd: posix.fd_t, path: []const u8) !void {
-    var addr: posix.sockaddr.un = .{
-        .family = posix.AF.UNIX,
-        .path = @splat(0),
-    };
-    if (path.len >= addr.path.len) return error.PathTooLong;
-    @memcpy(addr.path[0..path.len], path);
-    if (std.c.bind(fd, @ptrCast(&addr), @sizeOf(@TypeOf(addr))) != 0) {
-        log.warn("bind {s} failed: errno={d}", .{ path, @intFromEnum(std.c.errno(@as(c_int, -1))) });
-        return error.ClientSocketBindFailed;
-    }
-}
-
-fn connectUnix(fd: posix.fd_t, path: []const u8) !void {
-    var addr: posix.sockaddr.un = .{
-        .family = posix.AF.UNIX,
-        .path = @splat(0),
-    };
-    if (path.len >= addr.path.len) return error.PathTooLong;
-    @memcpy(addr.path[0..path.len], path);
-    if (std.c.connect(fd, @ptrCast(&addr), @sizeOf(@TypeOf(addr))) != 0) {
-        return error.ConnectFailed;
-    }
 }
 
 fn setRecvTimeout(fd: posix.fd_t, ms: u32) !void {
@@ -512,16 +270,6 @@ test "isTransportError treats any post error as transport-fatal except our-side 
     try std.testing.expect(!isTransportError(error.TooManyKeys));
 }
 
-test "encodeHeader writes magic + version + request" {
-    var buf: [16]u8 = undefined;
-    const n = encodeHeader(&buf, .virtual_hid_keyboard_initialize);
-    try std.testing.expectEqual(@as(usize, 5), n);
-    try std.testing.expectEqual(@as(u8, 'c'), buf[0]);
-    try std.testing.expectEqual(@as(u8, 'p'), buf[1]);
-    try std.testing.expectEqual(@as(u16, 5), std.mem.readInt(u16, buf[2..4], .little));
-    try std.testing.expectEqual(@as(u8, 1), buf[4]);
-}
-
 test "Modifier packs to 8 bits matching Karabiner enum" {
     const m = Modifier{ .left_control = true, .right_command = true };
     const byte: u8 = @bitCast(m);
@@ -529,27 +277,59 @@ test "Modifier packs to 8 bits matching Karabiner enum" {
     try std.testing.expectEqual(@as(u8, 0x81), byte);
 }
 
-test "parseFrame: heartbeat carries LE u32 deadline; short body → 0" {
-    const hb = [_]u8{ 0, 0x10, 0x27, 0, 0 }; // 0x2710 = 10000ms
-    try std.testing.expectEqual(Frame{ .heartbeat = 10_000 }, parseFrame(&hb));
-    const short = [_]u8{ 0, 0x10 };
-    try std.testing.expectEqual(Frame{ .heartbeat = 0 }, parseFrame(&short));
+test "v8 client sends keyboard initialize and accepts ready response" {
+    var descriptors: [2]std.posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &descriptors));
+    var client: Client = .{ .socket = .{ .fd = descriptors[0] }, .fd = descriptors[0] };
+    defer client.close();
+    defer _ = std.c.close(descriptors[1]);
+
+    var response_storage: [32]u8 = undefined;
+    const response = try Stream.encodeFrame(&response_storage, .response, 1, &.{ 4, 1 });
+    try std.testing.expectEqual(@as(isize, @intCast(response.len)), std.c.send(descriptors[1], response.ptr, response.len, 0));
+
+    try client.initializeKeyboard(.{});
+    try client.waitForBoolTrue(.virtual_hid_keyboard_ready, 1000);
+
+    var request_storage: [64]u8 = undefined;
+    const received = std.c.recv(descriptors[1], &request_storage, request_storage.len, 0);
+    try std.testing.expect(received > 0);
+    const request = (try Stream.decodeFrame(request_storage[0..@intCast(received)])).?;
+    try std.testing.expectEqual(Stream.MessageType.request, request.message_type);
+    try std.testing.expectEqual(@as(?u64, 1), request.request_id);
+    try std.testing.expectEqual(@as(usize, 27), request.payload.len);
+    try std.testing.expectEqualSlices(u8, &.{ 7, 0, 0 }, request.payload[0..3]);
+    try std.testing.expectEqual(@as(u64, 0x05ac), std.mem.readInt(u64, request.payload[3..11], .little));
+    try std.testing.expectEqual(@as(u64, 0x024f), std.mem.readInt(u64, request.payload[11..19], .little));
 }
 
-test "parseFrame: user_data response with and without body" {
-    const ready_true = [_]u8{ 1, 4, 1 };
-    const f = parseFrame(&ready_true);
-    try std.testing.expectEqual(Response.virtual_hid_keyboard_ready, f.response.resp);
-    try std.testing.expectEqual(@as(?u8, 1), f.response.body_first);
+test "v8 client rejects driver version mismatch" {
+    var descriptors: [2]std.posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &descriptors));
+    var client: Client = .{ .socket = .{ .fd = descriptors[0] }, .fd = descriptors[0] };
+    defer client.close();
+    defer _ = std.c.close(descriptors[1]);
 
-    const bare = [_]u8{ 1, 2 }; // driver_connected, no body
-    const g = parseFrame(&bare);
-    try std.testing.expectEqual(Response.driver_connected, g.response.resp);
-    try std.testing.expectEqual(@as(?u8, null), g.response.body_first);
+    var response_storage: [32]u8 = undefined;
+    const response = try Stream.encodeFrame(&response_storage, .response, 1, &.{ 3, 1 });
+    try std.testing.expectEqual(@as(isize, @intCast(response.len)), std.c.send(descriptors[1], response.ptr, response.len, 0));
+    try std.testing.expectError(error.DriverVersionMismatch, client.waitForBoolTrue(.virtual_hid_keyboard_ready, 1000));
 }
 
-test "parseFrame: empty, header-only, and unknown types are .other" {
-    try std.testing.expectEqual(Frame.other, parseFrame(&.{}));
-    try std.testing.expectEqual(Frame.other, parseFrame(&.{1})); // user_data, no response byte
-    try std.testing.expectEqual(Frame.other, parseFrame(&.{ 9, 1, 2 })); // unknown envelope type
+test "v8 keyboard report matches DriverKit keyboard_input layout" {
+    var descriptors: [2]std.posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &descriptors));
+    var client: Client = .{ .socket = .{ .fd = descriptors[0] }, .fd = descriptors[0] };
+    defer client.close();
+    defer _ = std.c.close(descriptors[1]);
+
+    try client.postKeyboardReport(.{ .right_shift = true }, &.{0x0004});
+
+    var request_storage: [128]u8 = undefined;
+    const received = std.c.recv(descriptors[1], &request_storage, request_storage.len, 0);
+    try std.testing.expect(received > 0);
+    const request = (try Stream.decodeFrame(request_storage[0..@intCast(received)])).?;
+    try std.testing.expectEqual(@as(usize, 70), request.payload.len);
+    try std.testing.expectEqualSlices(u8, &.{ 7, 0, 6, 1, 0x20, 0, 4, 0 }, request.payload[0..8]);
+    for (request.payload[8..]) |byte| try std.testing.expectEqual(@as(u8, 0), byte);
 }

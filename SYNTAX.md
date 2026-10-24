@@ -339,12 +339,16 @@ directive = '.shell' <string> |
             '.define' <identifier> ':' <command_template> |
             '.device' <identifier> '{' <device_attrs> '}' |
             '.remap' <hid_key> <device_clause> ':' <hid_key> |
-            '.remap' <hid_key> <device_clause> '{' <taphold_attrs> '}'
+            '.remap' <hid_key> <device_clause> '{' <taphold_attrs> '}' |
+            '.remap' <hid_key> <device_clause> <app_clause> '{' <taphold_attrs> '}' |
+            '.remap' <hid_key> <device_clause> <app_clause> ':' 'passthrough'
 
 device_attrs    = 'vendor:' <hex>  ',' 'product:' <hex>
 device_clause   = '[' 'device' <identifier> ']'
+app_clause      = '[' 'app' <string> ']'
 taphold_attrs   = ( <taphold_attr> )+
 taphold_attr    = 'tap'                ':' <hid_key>
+                | 'tap_modifier'       ':' <hid_modifier_key>
                 | 'hold'               ':' <hid_key_or_layer>
                 | 'timeout'            ':' <duration>
                 | 'permissive_hold'    ':' ('on' | 'off')
@@ -538,6 +542,10 @@ holds. Routed through `skhd-grabber` (root LaunchDaemon) — see
 [skhd-grabber](README.md#skhd-grabber-caps_lock-class-tap-hold) in the
 README for install + permission setup.
 
+App-scoped tap-hold rules and `: passthrough` are available behind the
+development fork's default-off experimental gate. They are not ready for
+unattended keyboard replacement; see [the rollout gates](docs/APP_SCOPED_REMAPS.md).
+
 ```bash
 .remap caps_lock [device builtin] {
     tap             : escape
@@ -558,6 +566,7 @@ JSON dialect — skhd users want a config that reads like the rest of
 | Attribute | Type | Default | QMK equivalent | Description |
 |---|---|---|---|---|
 | `tap` | hid_key | required | `LT(layer, kc)` tap behavior | Key emitted on a quick tap (press + release within `timeout`). |
+| `tap_modifier` | HID modifier key | none | — | Optional modifier held only while emitting `tap` (for example, `rcmd` with `f19`). Accepts `lctrl` through `rcmd`. |
 | `hold` | hid_key or mode | required | `LT(layer, kc)` hold behavior | Key emitted while held past `timeout`. A mode identifier here makes it a **layer hold** (see below). |
 | `timeout` | duration | `200ms` | [`TAPPING_TERM`](https://github.com/qmk/qmk_firmware/blob/master/docs/tap_hold.md#tapping-term) | How long the source key has to be held to commit the hold action. |
 | `permissive_hold` | `on`/`off` | `on` | [`PERMISSIVE_HOLD`](https://github.com/qmk/qmk_firmware/blob/master/docs/tap_hold.md#permissive-hold) | If `on`, a nested down+up of another key while the source is held also commits the hold modifier. Useful for typing Ctrl+A by holding caps for ~50ms then quickly tapping `a`. |

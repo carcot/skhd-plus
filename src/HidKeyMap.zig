@@ -73,12 +73,13 @@ const Map = std.StaticStringMap(u32).initComptime(&.{
     .{ "up", 0x52 },
     .{ "down", 0x51 },
 
-    // F-row (F1..F20)
+    // F-row (F1..F24)
     .{ "f1", 0x3A },  .{ "f2", 0x3B },  .{ "f3", 0x3C },  .{ "f4", 0x3D },
     .{ "f5", 0x3E },  .{ "f6", 0x3F },  .{ "f7", 0x40 },  .{ "f8", 0x41 },
     .{ "f9", 0x42 },  .{ "f10", 0x43 }, .{ "f11", 0x44 }, .{ "f12", 0x45 },
     .{ "f13", 0x68 }, .{ "f14", 0x69 }, .{ "f15", 0x6A }, .{ "f16", 0x6B },
     .{ "f17", 0x6C }, .{ "f18", 0x6D }, .{ "f19", 0x6E }, .{ "f20", 0x6F },
+    .{ "f21", 0x70 }, .{ "f22", 0x71 }, .{ "f23", 0x72 }, .{ "f24", 0x73 },
 
     // Letters
     .{ "a", 0x04 }, .{ "b", 0x05 }, .{ "c", 0x06 }, .{ "d", 0x07 },
@@ -115,6 +116,8 @@ test "lookup returns expected HID usage codes" {
     try std.testing.expectEqual(@as(?u32, 0x39), lookup("caps_lock"));
     try std.testing.expectEqual(@as(?u32, 0xE0), lookup("lctrl"));
     try std.testing.expectEqual(@as(?u32, 0x6D), lookup("f18"));
+    try std.testing.expectEqual(@as(?u32, 0x72), lookup("f23"));
+    try std.testing.expectEqual(@as(?u32, 0x73), lookup("f24"));
     try std.testing.expectEqual(@as(?u32, null), lookup("does_not_exist"));
 }
 

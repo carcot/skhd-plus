@@ -21,6 +21,8 @@ const protocol = @import("grabber_protocol");
 const HidSeize = @import("HidSeize.zig");
 const HidSystem = @import("HidSystem.zig");
 const Ipc = @import("Ipc.zig");
+const ForegroundUpdate = @import("ForegroundUpdate.zig");
+const AppRuleSelector = @import("AppRuleSelector.zig");
 const KbState = @import("KbState.zig");
 const DeviceNotify = @import("DeviceNotify.zig");
 const PowerNotify = @import("PowerNotify.zig");
@@ -40,7 +42,6 @@ pub const version = std.mem.trimEnd(u8, @embedFile("VERSION"), "\n\r\t ");
 /// ReleaseFast/ReleaseSmall every profile branch folds away at
 /// comptime so the seize hot path pays nothing for it.
 const profile_supported = builtin.mode == .Debug or builtin.mode == .ReleaseSafe;
-
 
 pub const std_options: std.Options = .{
     .log_level = switch (builtin.mode) {
@@ -83,20 +84,7 @@ fn grabberLog(
     std.log.defaultLogFileTerminal(level, scope, format, args, t) catch {};
 }
 
-/// Set by SIGTERM/SIGINT/SIGHUP so the accept() loop tears down on
-/// next iteration. async-signal-safe by being volatile primitives only.
-var should_exit: std.atomic.Value(bool) = .init(false);
-
-/// Path of the bound socket; the SIGTERM handler uses it to unlink
-/// before exit so a stale file doesn't block respawn.
-var bound_socket_path: ?[]const u8 = null;
-
 pub fn main(init: std.process.Init) !void {
-    // stderr → file is block-buffered by libc default. Our SIGTERM
-    // handler exits via _exit() which skips fflush, so block-buffered
-    // logs from the seize loop never reach the log file. Switching
-    // stderr (and stdout for symmetry) to unbuffered fixes that —
-    // each log line goes to the fd immediately.
     _ = c.setvbuf(c.__stderrp, null, c._IONBF, 0);
     _ = c.setvbuf(c.__stdoutp, null, c._IONBF, 0);
 
@@ -118,6 +106,7 @@ pub fn main(init: std.process.Init) !void {
     // The daemon path takes rules from the IPC RuleSet instead; this
     // slot only feeds seizeTest() for standalone HID-pipeline bring-up.
     var seize_test_rule: ?TapHold.Rule = null;
+    var experimental_app_scoped_rules = false;
     // -P/--profile: emit one stderr line per HID-in / timer-sched /
     // timer-fire / vhidd-post boundary so cold-start lag and steady-
     // state cost can be measured. No effect on the no-profile path.
@@ -137,15 +126,64 @@ pub fn main(init: std.process.Init) !void {
             // launchd's plist handles redirection in production; flag
             // accepted for symmetry with other daemons but unused at
             // D1. D6 will hook it up to a stderr redirect.
+        } else if (std.mem.eql(u8, a, "--experimental-app-scoped-rules")) {
+            experimental_app_scoped_rules = true;
         } else if (std.mem.eql(u8, a, "--version") or std.mem.eql(u8, a, "-v")) {
             std.debug.print("skhd-grabber v{s}\n", .{version});
             return;
         } else if (std.mem.eql(u8, a, "--help") or std.mem.eql(u8, a, "-h")) {
             printHelp();
             return;
+        } else if (std.mem.eql(u8, a, "--vhidd-probe")) {
+            var client = Vhidd.Client.connect(gpa, io) catch |err| {
+                log.err("vhidd connection failed: {s}", .{@errorName(err)});
+                std.process.exit(1);
+            };
+            client.close();
+            log.info("vhidd connection succeeded (no keyboard initialized or captured)", .{});
+            return;
+        } else if (std.mem.eql(u8, a, "--vhidd-ready-probe")) {
+            var client = Vhidd.Client.connect(gpa, io) catch |err| {
+                log.err("vhidd readiness connection failed: {s}", .{@errorName(err)});
+                std.process.exit(1);
+            };
+            defer client.close();
+            try client.initializeKeyboard(.{});
+            defer client.sendRequest(.virtual_hid_keyboard_terminate) catch {};
+            try client.waitForBoolTrue(.virtual_hid_keyboard_ready, 5000);
+            log.info("vhidd virtual keyboard ready (no key injected or physical keyboard captured)", .{});
+            return;
+        } else if (std.mem.eql(u8, a, "--vhidd-post-probe")) {
+            var client = try Vhidd.Client.connect(gpa, io);
+            defer client.close();
+            try client.initializeKeyboard(.{});
+            defer client.sendRequest(.virtual_hid_keyboard_terminate) catch {};
+            try client.waitForBoolTrue(.virtual_hid_keyboard_ready, 5000);
+            try client.postKeyboardReport(.{}, &.{0x73});
+            errdefer client.postKeyboardReport(.{}, &.{}) catch {};
+            std.Io.sleep(io, .fromMilliseconds(50), .awake) catch {};
+            try client.postKeyboardReport(.{}, &.{});
+            std.Io.sleep(io, .fromMilliseconds(50), .awake) catch {};
+            log.info("vhidd F24 down/up reports sent (no physical keyboard captured)", .{});
+            return;
         } else if (std.mem.eql(u8, a, "--inject-test-key")) {
             injectTestKey(gpa, io) catch |err| {
                 log.err("inject-test-key failed: {s}", .{@errorName(err)});
+                std.process.exit(1);
+            };
+            return;
+        } else if (std.mem.eql(u8, a, "--match-probe")) {
+            i += 1;
+            if (i >= args.len) {
+                std.debug.print("error: --match-probe requires V:P\n", .{});
+                std.process.exit(2);
+            }
+            const pair = parseVendorProduct(args[i]) catch {
+                std.debug.print("error: --match-probe arg must be VEND:PROD\n", .{});
+                std.process.exit(2);
+            };
+            matchProbe(gpa, .{ .vendor = pair[0], .product = pair[1] }) catch |err| {
+                log.err("match-probe failed: {s}", .{@errorName(err)});
                 std.process.exit(1);
             };
             return;
@@ -189,16 +227,29 @@ pub fn main(init: std.process.Init) !void {
                 std.debug.print("error: --seize-test-duration requires seconds\n", .{});
                 std.process.exit(2);
             }
-            seize_test_duration_ms = (std.fmt.parseInt(u32, args[i], 10) catch {
+            const duration_seconds = std.fmt.parseInt(u32, args[i], 10) catch {
                 std.debug.print("error: invalid seconds: {s}\n", .{args[i]});
                 std.process.exit(2);
-            }) * 1000;
+            };
+            if (duration_seconds < 1 or duration_seconds > 60) {
+                std.debug.print("error: --seize-test-duration must be 1–60 seconds\n", .{});
+                std.process.exit(2);
+            }
+            seize_test_duration_ms = duration_seconds * 1000;
         } else {
             std.debug.print("error: unknown argument: {s}\n", .{a});
             std.process.exit(2);
         }
     }
 
+    if (seize_test_observe and seize_test_vendor == null) {
+        std.debug.print("error: --seize-test-observe requires --seize-test V:P\n", .{});
+        std.process.exit(2);
+    }
+    if (experimental_app_scoped_rules and (seize_test_vendor != null or std.mem.eql(u8, socket_path, protocol.default_socket_path))) {
+        std.debug.print("error: --experimental-app-scoped-rules requires a separate --socket-path and no --seize-test\n", .{});
+        std.process.exit(2);
+    }
     if (seize_test_vendor) |vendor| {
         const product = seize_test_product.?;
         const mode: HidSeize.Mode = if (seize_test_observe) .observe else .seize;
@@ -211,13 +262,13 @@ pub fn main(init: std.process.Init) !void {
 
     log.info("skhd-grabber starting (socket={s}, pid={d})", .{ socket_path, std.c.getpid() });
 
-    var daemon = Daemon.init(gpa, io, socket_path, profile) catch |err| {
+    var daemon = Daemon.init(gpa, io, socket_path, profile, experimental_app_scoped_rules) catch |err| {
         log.err("daemon init failed: {s}", .{@errorName(err)});
         return err;
     };
     defer daemon.deinit();
 
-    installSignalHandlers();
+    ignoreSigpipe();
     daemon.run();
 
     log.info("shutting down", .{});
@@ -243,6 +294,9 @@ const Subscription = struct {
     stream: std.Io.net.Stream,
     rules: []protocol.Rule,
     remaps: []protocol.Remap,
+    app_id: ?[]const u8,
+    recv_buffer: [ForegroundUpdate.max_frame_bytes]u8 = undefined,
+    recv_len: usize = 0,
     /// Mirror of NSGlobalDomain `com.apple.keyboard.fnState` as read by
     /// the agent. Drives whether bare F-row should translate to media
     /// (false, OS default) or stay literal (true).
@@ -255,6 +309,7 @@ const Daemon = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     socket_path: []const u8,
+    allow_app_scoped_rules: bool,
     server: std.Io.net.Server,
 
     /// One per live agent connection. Most-recently-pushed apply_rules
@@ -272,6 +327,9 @@ const Daemon = struct {
     /// Lazy: connected on the first apply_rules so a daemon with no
     /// rules pending doesn't spend 3s probing vhidd at startup.
     vhidd: ?*Vhidd.Client = null,
+    /// A report-construction error cannot be repaired by reconnecting.
+    /// Keep physical input uncaptured until the daemon is restarted.
+    capture_disabled: bool = false,
     /// Lazy: created on first apply_rules, recreated each rebuild.
     seize: ?*HidSeize = null,
     /// Slot array owned by the Daemon, sized to the current rule list.
@@ -356,7 +414,7 @@ const Daemon = struct {
     /// One "heartbeats flowing (deadline=Nms)" info line per connection.
     vhidd_hb_logged: bool = false,
 
-    pub fn init(allocator: std.mem.Allocator, io: std.Io, socket_path: []const u8, profile: bool) !Daemon {
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, socket_path: []const u8, profile: bool, allow_app_scoped_rules: bool) !Daemon {
         try ensureSocketParentDir(socket_path);
         // Stale socket from a crashed previous run: bind() would EADDRINUSE.
         // libc unlink — Daemon.init runs before io is fully wired.
@@ -371,7 +429,6 @@ const Daemon = struct {
         var server = try addr.listen(io, .{});
         errdefer server.deinit(io);
 
-        bound_socket_path = socket_path;
         // Mode 0666 so any logged-in user's agent can connect. Per-uid
         // auth lands in D5 (uid is already carried in `hello`).
         chmodPath(socket_path, 0o666) catch |err| {
@@ -397,6 +454,7 @@ const Daemon = struct {
             .allocator = allocator,
             .io = io,
             .socket_path = socket_path,
+            .allow_app_scoped_rules = allow_app_scoped_rules,
             .server = server,
             .seize_ctx = .{
                 .state = .{},
@@ -457,7 +515,6 @@ const Daemon = struct {
         if (self.seize_ctx.hidsystem) |*h| h.deinit();
         self.server.deinit(self.io);
         std.Io.Dir.deleteFileAbsolute(self.io, self.socket_path) catch {};
-        bound_socket_path = null;
     }
 
     /// Release everything a Subscription owns. Called from
@@ -469,9 +526,13 @@ const Daemon = struct {
         c.CFFileDescriptorInvalidate(s.cf_fd);
         c.CFRelease(s.cf_fd);
         s.stream.close(self.io);
-        for (s.rules) |r| if (r.hold_layer) |l| self.allocator.free(l);
+        for (s.rules) |r| {
+            if (r.hold_layer) |l| self.allocator.free(l);
+            if (r.app_id) |app_id| self.allocator.free(app_id);
+        }
         self.allocator.free(s.rules);
         self.allocator.free(s.remaps);
+        if (s.app_id) |app_id| self.allocator.free(app_id);
         self.allocator.destroy(s);
     }
 
@@ -515,7 +576,7 @@ const Daemon = struct {
 
         log.info("listening on {s}", .{self.socket_path});
 
-        while (!should_exit.load(.acquire)) {
+        while (true) {
             const rc = c.CFRunLoopRunInMode(c.kCFRunLoopDefaultMode, 60.0, 0);
             switch (rc) {
                 c.kCFRunLoopRunStopped, c.kCFRunLoopRunFinished => break,
@@ -557,7 +618,7 @@ const Daemon = struct {
             return;
         };
 
-        const result = Ipc.serve(self.allocator, self.io, conn) catch |err| blk: {
+        const result = Ipc.serve(self.allocator, self.io, conn, self.allow_app_scoped_rules) catch |err| blk: {
             log.warn("client session ended: {s}", .{@errorName(err)});
             break :blk Ipc.ServeResult.closed;
         };
@@ -595,6 +656,7 @@ const Daemon = struct {
             .stream = stream,
             .rules = applied.rules,
             .remaps = applied.remaps,
+            .app_id = applied.app_id,
             .fkeys_as_standard = applied.fkeys_as_standard,
             .cf_fd = undefined,
             .cf_source = undefined,
@@ -676,6 +738,10 @@ const Daemon = struct {
     /// or the console user switched. The active subscription's
     /// stream becomes the layer-push target.
     fn applyLatestRules(self: *Daemon) !void {
+        if (self.capture_disabled) {
+            self.teardownSeize();
+            return error.CaptureDisabled;
+        }
         // While the system is asleep the seize must stay torn down: the
         // device is powering down/up and a seize taken across that
         // transition goes stale. onSystemWake re-runs this after clearing
@@ -752,11 +818,10 @@ const Daemon = struct {
             try v.initializeKeyboard(.{});
             try v.waitForBoolTrue(.virtual_hid_keyboard_ready, 5000);
             log.info("virtual keyboard ready", .{});
+            try std.Io.sleep(self.io, .fromMilliseconds(500), .awake);
+            try self.startVhiddWatch(v);
             self.vhidd = v;
             self.seize_ctx.vhidd = v;
-            // Handshake done — hand the socket to the heartbeat
-            // watchdog (no synchronous recv beyond this point).
-            self.startVhiddWatch();
         }
 
         // Layer push target = the active subscription's stream
@@ -775,14 +840,27 @@ const Daemon = struct {
         // iterating it.
         const slots = try self.allocator.alloc(EngineSlot, rules.len);
         errdefer self.allocator.free(slots);
+        const candidates = try self.allocator.alloc(AppRuleSelector.Candidate, rules.len);
+        errdefer self.allocator.free(candidates);
+        var has_app_rules = false;
 
         for (rules, 0..) |rule, i| {
+            const device = rule.device.?;
+            candidates[i] = .{
+                .src_usage = rule.src_usage,
+                .device_vendor = device.vendor,
+                .device_product = device.product,
+                .app_id = rule.app_id,
+                .passthrough = rule.passthrough,
+            };
+            if (rule.app_id != null or rule.passthrough) has_app_rules = true;
             const hold_action: TapHold.HoldAction = if (rule.hold_layer) |layer_name| .{ .layer = layer_name } else .{
                 .hid_usage = std.math.cast(u16, rule.hold_usage) orelse return error.HoldUsageOverflow,
             };
             const th_rule: TapHold.Rule = .{
                 .src_usage = std.math.cast(u16, rule.src_usage) orelse return error.SourceUsageOverflow,
                 .tap_usage = std.math.cast(u16, rule.tap_usage) orelse return error.TapUsageOverflow,
+                .tap_modifier_usage = std.math.cast(u16, rule.tap_modifier_usage) orelse return error.TapModifierUsageOverflow,
                 .hold = hold_action,
                 .timeout_ms = rule.timeout_ms,
                 .permissive_hold = rule.permissive_hold,
@@ -807,10 +885,14 @@ const Daemon = struct {
         errdefer seize.deinit();
         try seize.setMatches(matches.items);
         try seize.start(.seize);
+        if (has_app_rules and (matches.items.len != 1 or seize.matchedCount() != 1)) return error.AppScopedRequiresSingleKeyboard;
 
         // Past the failure boundary: commit ownership atomically.
         self.slots = slots;
         self.seize_ctx.slots = slots;
+        self.seize_ctx.candidates = candidates;
+        self.seize_ctx.scoped_rules_active = has_app_rules;
+        self.seize_ctx.latches.clear();
         self.seize = seize;
 
         // Cache: do we have any caps_lock remap? Drives the per-event
@@ -857,6 +939,10 @@ const Daemon = struct {
         if (self.slots.len > 0) self.allocator.free(self.slots);
         self.slots = &.{};
         self.seize_ctx.slots = &.{};
+        if (self.seize_ctx.candidates.len > 0) self.allocator.free(self.seize_ctx.candidates);
+        self.seize_ctx.candidates = &.{};
+        self.seize_ctx.scoped_rules_active = false;
+        self.seize_ctx.latches.clear();
         self.seize_ctx.caps_remap_active = false;
         self.seize_ctx.remap_table = @splat(0);
         // Drop any virtual keys we left held so a re-apply starts clean.
@@ -937,7 +1023,8 @@ const Daemon = struct {
             &ctx,
         );
         if (timer == null) {
-            log.warn("post-wake verify timer create failed; a dead wake seize won't self-heal", .{});
+            log.err("post-wake verify timer create failed — releasing seize", .{});
+            self.teardownSeize();
             return;
         }
         self.post_wake_timer = timer;
@@ -969,8 +1056,7 @@ const Daemon = struct {
     /// connection. Must be called AFTER the synchronous connect
     /// handshake (waitForBoolTrue) — once the read source exists, no
     /// synchronous recv may run on this fd again until stopVhiddWatch.
-    fn startVhiddWatch(self: *Daemon) void {
-        const v = self.vhidd orelse return;
+    fn startVhiddWatch(self: *Daemon, v: *Vhidd.Client) !void {
         self.stopVhiddWatch();
 
         var ctx: c.CFFileDescriptorContext = .{
@@ -988,25 +1074,24 @@ const Daemon = struct {
             &ctx,
         );
         if (cf_fd == null) {
-            log.warn("vhidd watchdog: CFFileDescriptorCreate failed — heartbeat monitoring disabled", .{});
-            return;
+            return error.VhiddWatchCreateFailed;
         }
         const src = c.CFFileDescriptorCreateRunLoopSource(c.kCFAllocatorDefault, cf_fd, 0);
         if (src == null) {
-            log.warn("vhidd watchdog: run-loop source create failed — heartbeat monitoring disabled", .{});
             c.CFFileDescriptorInvalidate(cf_fd);
             c.CFRelease(cf_fd);
-            return;
+            return error.VhiddWatchSourceCreateFailed;
         }
         self.vhidd_watch_fd = cf_fd;
         self.vhidd_watch_source = src;
+        errdefer self.stopVhiddWatch();
         self.vhidd_hb_logged = false;
         c.CFRunLoopAddSource(c.CFRunLoopGetCurrent(), src, c.kCFRunLoopDefaultMode);
         c.CFFileDescriptorEnableCallBacks(cf_fd, c.kCFFileDescriptorReadCallBack);
         // Grace window for the first heartbeat. A server that never
         // heartbeats this session is indistinguishable from a wedged
         // one — rebuild.
-        self.armVhiddDeadline(vhidd_deadline_default_ms);
+        try self.armVhiddDeadline(vhidd_deadline_default_ms);
     }
 
     fn stopVhiddWatch(self: *Daemon) void {
@@ -1032,7 +1117,7 @@ const Daemon = struct {
     /// (~5s, forever), so no per-heartbeat create/destroy churn. It's
     /// nominally repeating with an effectively-infinite interval so a
     /// fire doesn't invalidate it; teardown is cancelVhiddDeadline.
-    fn armVhiddDeadline(self: *Daemon, deadline_ms: u32) void {
+    fn armVhiddDeadline(self: *Daemon, deadline_ms: u32) !void {
         if (self.sleeping) return;
         const total_ms = deadline_ms + vhidd_deadline_grace_ms;
         const fire_at = c.CFAbsoluteTimeGetCurrent() + @as(f64, @floatFromInt(total_ms)) / 1000.0;
@@ -1056,7 +1141,7 @@ const Daemon = struct {
             vhiddDeadlineCallback,
             &ctx,
         );
-        if (timer == null) return; // watchdog degraded, not fatal
+        if (timer == null) return error.VhiddDeadlineCreateFailed;
         self.vhidd_deadline_timer = timer;
         c.CFRunLoopAddTimer(c.CFRunLoopGetCurrent(), timer, c.kCFRunLoopDefaultMode);
     }
@@ -1069,34 +1154,56 @@ const Daemon = struct {
         }
     }
 
-    /// Drain every pending datagram (non-blocking) and react:
+    /// Drain every pending stream frame (non-blocking) and react:
     /// heartbeat → re-arm the deadline; ready=false push → rebuild.
     fn handleVhiddReadable(self: *Daemon) void {
         const v = self.vhidd orelse return;
-        var buf: [1024]u8 = undefined;
         while (true) {
-            const n_signed = std.c.recv(v.fd, &buf, buf.len, std.c.MSG.DONTWAIT);
-            if (n_signed <= 0) break; // EAGAIN / error / empty → done draining
-            const n: usize = @intCast(n_signed);
-            switch (Vhidd.parseFrame(buf[0..n])) {
-                .heartbeat => |announced_ms| {
-                    // Clamp the announced deadline: 0 = malformed body,
-                    // absurd values would disarm the watchdog.
-                    const ms = std.math.clamp(announced_ms, vhidd_deadline_min_ms, vhidd_deadline_max_ms);
+            const incoming = v.receive() catch |err| {
+                log.warn("vhidd stream read failed: {s}", .{@errorName(err)});
+                self.markVhiddBroken();
+                return;
+            } orelse break;
+            switch (incoming.message_type) {
+                .heartbeat => {
+                    self.armVhiddDeadline(vhidd_deadline_default_ms) catch |err| {
+                        log.warn("vhidd deadline re-arm failed: {s}", .{@errorName(err)});
+                        self.markVhiddBroken();
+                        return;
+                    };
                     if (!self.vhidd_hb_logged) {
                         self.vhidd_hb_logged = true;
-                        log.info("vhidd heartbeats flowing (deadline={d}ms)", .{announced_ms});
+                        log.info("vhidd stream heartbeats flowing", .{});
                     }
-                    self.armVhiddDeadline(ms);
-                },
-                .response => |r| {
-                    if (r.resp == .virtual_hid_keyboard_ready and r.body_first == 0) {
-                        log.warn("vhidd pushed keyboard_ready=false — virtual device gone, rebuilding", .{});
+                    v.sendHeartbeat() catch |err| {
+                        log.warn("vhidd heartbeat send failed: {s}", .{@errorName(err)});
                         self.markVhiddBroken();
-                        return; // recovery will tear this watch down
+                        return;
+                    };
+                },
+                .request, .response => {
+                    if (incoming.message_type == .request) {
+                        v.sendResponse(incoming.request_id.?) catch |err| {
+                            log.warn("vhidd response send failed: {s}", .{@errorName(err)});
+                            self.markVhiddBroken();
+                            return;
+                        };
+                    }
+                    var offset: usize = 0;
+                    while (offset + 1 < incoming.payload.len) : (offset += 2) {
+                        if (incoming.payload[offset] == @intFromEnum(Vhidd.Response.driver_version_mismatched) and incoming.payload[offset + 1] != 0) {
+                            log.warn("vhidd reported driver version mismatch — releasing seize", .{});
+                            self.markVhiddBroken();
+                            return;
+                        }
+                        if (incoming.payload[offset] == @intFromEnum(Vhidd.Response.virtual_hid_keyboard_ready) and incoming.payload[offset + 1] == 0) {
+                            log.warn("vhidd pushed keyboard_ready=false — virtual device gone, rebuilding", .{});
+                            self.markVhiddBroken();
+                            return;
+                        }
                     }
                 },
-                .other => {},
+                else => {},
             }
         }
     }
@@ -1105,6 +1212,14 @@ const Daemon = struct {
         if (self.seize_ctx.vhidd_broken) return;
         self.seize_ctx.vhidd_broken = true;
         log.warn("vhidd transport broken — releasing seize, will retry connect", .{});
+        self.scheduleVhiddRecovery(0);
+    }
+
+    fn disableCapture(self: *Daemon) void {
+        if (self.capture_disabled) return;
+        self.capture_disabled = true;
+        self.seize_ctx.vhidd_broken = true;
+        log.err("unrecoverable vhidd report error — releasing seize; restart required", .{});
         self.scheduleVhiddRecovery(0);
     }
 
@@ -1128,7 +1243,8 @@ const Daemon = struct {
             &ctx,
         );
         if (timer == null) {
-            log.err("vhidd recovery timer create failed — manual restart required", .{});
+            log.err("vhidd recovery timer create failed — releasing seize; manual restart required", .{});
+            if (self.seize) |seize| seize.stop();
             return;
         }
         self.vhidd_recovery_timer = timer;
@@ -1161,6 +1277,7 @@ const Daemon = struct {
             // then would be unsafe, but the seize is torn down so no
             // callback can do that.
         }
+        if (self.capture_disabled) return;
         self.applyLatestRules() catch |err| {
             const next = Vhidd.nextBackoffMs(self.vhidd_recovery_backoff_ms);
             log.warn("vhidd reconnect failed: {s} — retrying in {d}ms", .{ @errorName(err), next });
@@ -1173,7 +1290,6 @@ const Daemon = struct {
         self.vhidd_recovery_backoff_ms = 0;
     }
 };
-
 
 fn consoleUserTimerCallback(_: c.CFRunLoopTimerRef, info: ?*anyopaque) callconv(.c) void {
     const d: *Daemon = @ptrCast(@alignCast(info orelse return));
@@ -1275,7 +1391,10 @@ fn onSystemWake(ctx: ?*anyopaque) void {
     // seconds of lid-open, no user action needed. (An in-place ready
     // probe was tried and removed: a wedged session still answers
     // ready=true — 2026-07-11 incident.)
-    if (d.vhidd != null) d.armVhiddDeadline(vhidd_deadline_default_ms);
+    if (d.vhidd != null) d.armVhiddDeadline(vhidd_deadline_default_ms) catch |err| {
+        log.warn("post-wake vhidd deadline re-arm failed: {s}", .{@errorName(err)});
+        d.markVhiddBroken();
+    };
     // Kick off verification — did that seize actually come up live?
     d.post_wake_attempt = 0;
     d.schedulePostWakeVerify();
@@ -1368,12 +1487,6 @@ fn listenerCallback(
     c.CFFileDescriptorEnableCallBacks(cf_fd, c.kCFFileDescriptorReadCallBack);
 }
 
-/// CFFileDescriptor callback for an active Subscription's socket.
-/// Fires either when the agent writes to us (which it shouldn't —
-/// the post-apply_rules direction is server → client only) or when
-/// the OS marks the fd readable due to EOS (peer closed). Either
-/// way we attempt a 1-byte read; 0-byte recv → EOS → drop the sub.
-/// A successful read of unexpected bytes is logged but kept alive.
 fn subscriptionCallback(
     cf_fd: c.CFFileDescriptorRef,
     callback_types: c.CFOptionFlags,
@@ -1382,32 +1495,46 @@ fn subscriptionCallback(
     _ = callback_types;
     const sub: *Subscription = @ptrCast(@alignCast(info orelse return));
 
-    var byte: [1]u8 = undefined;
-    const n = c.recv(sub.fd, &byte, byte.len, c.MSG_PEEK | c.MSG_DONTWAIT);
-    if (n < 0) {
-        // EAGAIN and EWOULDBLOCK share the same value on macOS; one match
-        // covers both per recv(2). Anything else means the connection is
-        // gone and we drop the subscription.
-        const errno = std.c._errno().*;
-        if (errno == @intFromEnum(std.c.E.AGAIN)) {
-            c.CFFileDescriptorEnableCallBacks(cf_fd, c.kCFFileDescriptorReadCallBack);
+    while (true) {
+        if (sub.recv_len == sub.recv_buffer.len) {
+            sub.daemon.handleConnectionClose(sub);
             return;
         }
-        log.info("subscription recv error (errno={d}) — dropping", .{errno});
-        sub.daemon.handleConnectionClose(sub);
-        return;
+        const target = sub.recv_buffer[sub.recv_len..];
+        const received = c.recv(sub.fd, target.ptr, target.len, c.MSG_DONTWAIT);
+        if (received < 0) {
+            const errno = std.c._errno().*;
+            if (errno == @intFromEnum(std.c.E.AGAIN)) break;
+            log.info("subscription recv error (errno={d}) — dropping", .{errno});
+            sub.daemon.handleConnectionClose(sub);
+            return;
+        }
+        if (received == 0) {
+            sub.daemon.handleConnectionClose(sub);
+            return;
+        }
+        sub.recv_len += @intCast(received);
+
+        while (true) {
+            const update = ForegroundUpdate.decode(sub.daemon.allocator, sub.recv_buffer[0..sub.recv_len]) catch |err| {
+                log.warn("subscription uid={d}: invalid foreground update: {s}", .{ sub.uid, @errorName(err) });
+                sub.daemon.handleConnectionClose(sub);
+                return;
+            } orelse break;
+            const new_app_id: ?[]const u8 = if (update.bundleId()) |id|
+                sub.daemon.allocator.dupe(u8, id) catch {
+                    sub.daemon.handleConnectionClose(sub);
+                    return;
+                }
+            else
+                null;
+            if (sub.app_id) |old_id| sub.daemon.allocator.free(old_id);
+            sub.app_id = new_app_id;
+            const remaining = sub.recv_len - update.total_bytes;
+            std.mem.copyForwards(u8, sub.recv_buffer[0..remaining], sub.recv_buffer[update.total_bytes..sub.recv_len]);
+            sub.recv_len = remaining;
+        }
     }
-    if (n == 0) {
-        // Peer closed cleanly.
-        sub.daemon.handleConnectionClose(sub);
-        return;
-    }
-    // Unexpected stray data from agent. Drain it and stay armed —
-    // the agent shouldn't send anything after apply_rules but we
-    // tolerate it rather than tear down.
-    log.warn("subscription uid={d}: unexpected {d} byte(s) from agent — discarding", .{ sub.uid, n });
-    var drain: [256]u8 = undefined;
-    _ = c.recv(sub.fd, &drain, drain.len, c.MSG_DONTWAIT);
     c.CFFileDescriptorEnableCallBacks(cf_fd, c.kCFFileDescriptorReadCallBack);
 }
 
@@ -1447,45 +1574,13 @@ fn chmodPath(path: []const u8, mode: u32) !void {
     if (rc != 0) return error.ChmodFailed;
 }
 
-fn installSignalHandlers() void {
-    var act: posix.Sigaction = .{
-        .handler = .{ .handler = handleSignal },
-        .mask = posix.sigemptyset(),
-        .flags = 0,
-    };
-    posix.sigaction(.TERM, &act, null);
-    posix.sigaction(.INT, &act, null);
-    posix.sigaction(.HUP, &act, null);
-    // SIGPIPE: client dropped mid-write; we want EPIPE from write() and
-    // graceful continue, not whole-process termination.
+fn ignoreSigpipe() void {
     var ignore: posix.Sigaction = .{
         .handler = .{ .handler = posix.SIG.IGN },
         .mask = posix.sigemptyset(),
         .flags = 0,
     };
     posix.sigaction(.PIPE, &ignore, null);
-}
-
-fn handleSignal(_: posix.SIG) callconv(.c) void {
-    should_exit.store(true, .release);
-    // Best-effort unlink so the next launchd respawn binds cleanly.
-    // Path access is safe here because we set bound_socket_path once
-    // at startup before installing this handler.
-    if (bound_socket_path) |p| {
-        var path_buf: [std.fs.max_path_bytes:0]u8 = undefined;
-        if (p.len < path_buf.len) {
-            @memcpy(path_buf[0..p.len], p);
-            path_buf[p.len] = 0;
-            _ = std.c.unlink(&path_buf);
-        }
-    }
-    // accept() in the main loop retries internally on EINTR, so just
-    // setting a flag isn't enough to unblock it. _exit forces a clean
-    // shutdown without running atexit/destructors — fine here because
-    // the only stateful resource is the socket file we just unlinked.
-    // D5 will replace this with a self-pipe / kqueue wake-up so we can
-    // run normal teardown.
-    std.c._exit(0);
 }
 
 /// Connect to vhidd_server, initialize the virtual keyboard, wait for
@@ -1505,8 +1600,8 @@ fn injectTestKey(allocator: std.mem.Allocator, io: std.Io) !void {
 
     // Brief settle; in practice the ready signal is enough but Apple
     // Silicon DriverKit sometimes needs a beat before injection lands
-    // reliably (matches the example client's 100ms post-ready sleep).
-    std.Io.sleep(io, .fromMilliseconds(100), .awake) catch {};
+    // reliably (matches the example client's 500ms post-ready sleep).
+    std.Io.sleep(io, .fromMilliseconds(500), .awake) catch {};
 
     // 'a' (HID 0x04). Picked over Escape because Escape is invisible in
     // most terminals — 'a' shows up on screen so injection success is
@@ -1516,14 +1611,14 @@ fn injectTestKey(allocator: std.mem.Allocator, io: std.Io) !void {
     log.info("posting keydown (a, HID 0x{X:0>2})", .{test_usage});
     try client.postKeyboardReport(.{}, &.{test_usage});
 
-    std.Io.sleep(io, .fromMilliseconds(50), .awake) catch {};
+    std.Io.sleep(io, .fromMilliseconds(200), .awake) catch {};
 
     log.info("posting keyup (empty)", .{});
     try client.postKeyboardReport(.{}, &.{});
 
-    // Small post-write grace period before close so the kernel has
-    // time to deliver our final keyup before we tear the socket down.
-    std.Io.sleep(io, .fromMilliseconds(50), .awake) catch {};
+    // Keep the test client alive while the daemon's asynchronous
+    // report posts reach the kernel before the socket is closed.
+    std.Io.sleep(io, .fromMilliseconds(2000), .awake) catch {};
     log.info("done", .{});
 }
 
@@ -1563,6 +1658,9 @@ const SeizeCtx = struct {
     /// --seize-test pass-through paths; populated in the daemon
     /// loop after apply_rules.
     slots: []EngineSlot = &.{},
+    candidates: []AppRuleSelector.Candidate = &.{},
+    scoped_rules_active: bool = false,
+    latches: AppRuleSelector.Latches = .{},
     forwarded: u64 = 0,
     skipped_other_pages: u64 = 0,
     /// IOHIDSystem connection used to force caps_lock state off after
@@ -1668,7 +1766,7 @@ fn layerPushSink(ctx_ptr: ?*anyopaque, layer: []const u8, entering: bool) void {
     var wbuf: [256]u8 = undefined;
     var sw = stream.writer(lctx.io, &wbuf);
     protocol.writeMessage(&sw.interface, lctx.allocator, .{
-        .@"type" = "mode_change",
+        .type = "mode_change",
         .mode = target,
     }) catch |err| {
         log.warn("mode_change push failed: {s}", .{@errorName(err)});
@@ -1729,10 +1827,7 @@ fn emitToVhidd(ctx_ptr: ?*anyopaque, ev: TapHold.Event) void {
     const held = cx.state.compactedKeys();
     const t_pre: u64 = if (comptime profile_supported) (if (cx.profile) cx.profile_timer.read() else 0) else 0;
     cx.vhidd.postKeyboardReport(cx.state.modifiers, held) catch |err| {
-        log.warn("vhidd post failed: {s}", .{@errorName(err)});
-        if (Vhidd.isTransportError(err)) {
-            if (cx.daemon) |d| d.markVhiddBroken();
-        }
+        handleVhiddPostError(cx, err);
         return;
     };
     if (comptime profile_supported) {
@@ -1744,6 +1839,17 @@ fn emitToVhidd(ctx_ptr: ?*anyopaque, ev: TapHold.Event) void {
         }
     }
     cx.forwarded += 1;
+}
+
+fn handleVhiddPostError(cx: *SeizeCtx, err: anyerror) void {
+    log.warn("vhidd post failed: {s}", .{@errorName(err)});
+    if (cx.daemon) |daemon| {
+        if (Vhidd.isTransportError(err)) {
+            daemon.markVhiddBroken();
+        } else {
+            daemon.disableCapture();
+        }
+    }
 }
 
 fn applyTapHoldTimer(slot: *EngineSlot, action: TapHold.TimerAction) void {
@@ -1863,19 +1969,19 @@ fn translateFRow(cx: *SeizeCtx, raw_usage16: u16, pressed: bool) void {
         .consumer => |u| {
             if (!cx.consumer_state.apply(u, pressed)) return;
             cx.vhidd.postConsumerReport(cx.consumer_state.compacted()) catch |err| {
-                log.warn("vhidd consumer post failed: {s}", .{@errorName(err)});
+                handleVhiddPostError(cx, err);
             };
         },
         .apple_vendor_keyboard => |u| {
             if (!cx.apple_keyboard_state.apply(u, pressed)) return;
             cx.vhidd.postAppleVendorKeyboardReport(cx.apple_keyboard_state.compacted()) catch |err| {
-                log.warn("vhidd apple-keyboard post failed: {s}", .{@errorName(err)});
+                handleVhiddPostError(cx, err);
             };
         },
         .generic_desktop => |u| {
             if (!cx.generic_desktop_state.apply(u, pressed)) return;
             cx.vhidd.postGenericDesktopReport(cx.generic_desktop_state.compacted()) catch |err| {
-                log.warn("vhidd generic-desktop post failed: {s}", .{@errorName(err)});
+                handleVhiddPostError(cx, err);
             };
         },
     }
@@ -1908,6 +2014,8 @@ fn seizeInputCallback(ctx: ?*anyopaque, ev: HidSeize.Event) void {
         ev.pressed,
     });
 
+    if (cx.vhidd_broken) return;
+
     // Forward non-keyboard pages straight through vhidd so the F-row
     // default media actions (volume, brightness, play/pause, …) keep
     // working on the seized device. These pages don't run through
@@ -1920,19 +2028,19 @@ fn seizeInputCallback(ctx: ?*anyopaque, ev: HidSeize.Event) void {
             0x0C => {
                 if (!cx.consumer_state.apply(usage16, ev.pressed)) return;
                 cx.vhidd.postConsumerReport(cx.consumer_state.compacted()) catch |err| {
-                    log.warn("vhidd consumer post failed: {s}", .{@errorName(err)});
+                    handleVhiddPostError(cx, err);
                 };
             },
             0xFF => {
                 if (!cx.apple_top_case_state.apply(usage16, ev.pressed)) return;
                 cx.vhidd.postAppleVendorTopCaseReport(cx.apple_top_case_state.compacted()) catch |err| {
-                    log.warn("vhidd apple-top-case post failed: {s}", .{@errorName(err)});
+                    handleVhiddPostError(cx, err);
                 };
             },
             0xFF01 => {
                 if (!cx.apple_keyboard_state.apply(usage16, ev.pressed)) return;
                 cx.vhidd.postAppleVendorKeyboardReport(cx.apple_keyboard_state.compacted()) catch |err| {
-                    log.warn("vhidd apple-keyboard post failed: {s}", .{@errorName(err)});
+                    handleVhiddPostError(cx, err);
                 };
             },
             else => {}, // unknown page; ignore
@@ -1948,6 +2056,10 @@ fn seizeInputCallback(ctx: ?*anyopaque, ev: HidSeize.Event) void {
     // should drive our state machine.
     const raw_usage16 = std.math.cast(u16, ev.usage) orelse return;
     if (raw_usage16 < 0x04) return;
+    if (cx.scoped_rules_active and !ev.device_known) {
+        emitToVhidd(@ptrCast(cx), .{ .usage_page = 0x07, .usage = raw_usage16, .pressed = ev.pressed });
+        return;
+    }
 
     // F1..F12 on Apple's built-in keyboard need translation. Seizing
     // the keyboard service silences the OS's apple-vendor media-key
@@ -2019,13 +2131,26 @@ fn seizeInputCallback(ctx: ?*anyopaque, ev: HidSeize.Event) void {
     } else false;
 
     var any_consumed = false;
-    for (cx.slots) |*slot| {
-        if (event_is_some_slot_source and slot.engine.rule.src_usage != usage16) {
-            continue;
+    var scoped_route: AppRuleSelector.Route = .{ .is_source = false, .scoped_source = false, .selected = null };
+    if (cx.scoped_rules_active) {
+        var active_app_id: ?[]const u8 = null;
+        if (cx.daemon) |daemon| {
+            if (daemon.activeSubscription()) |sub| active_app_id = sub.app_id;
         }
-        const r = slot.engine.feed(taphold_event);
-        applyTapHoldTimer(slot, r.timer);
-        if (r.disposition == .consumed) any_consumed = true;
+        scoped_route = AppRuleSelector.route(cx.candidates, &cx.latches, ev.device_id, ev.device_vendor, ev.device_product, usage16, ev.pressed, active_app_id);
+        for (cx.slots, 0..) |*slot, index| {
+            if (!AppRuleSelector.shouldFeed(cx.candidates, &cx.latches, scoped_route, ev.device_id, ev.device_vendor, ev.device_product, usage16, index, slot.engine.state != .idle)) continue;
+            const result = slot.engine.feed(taphold_event);
+            applyTapHoldTimer(slot, result.timer);
+            if (result.disposition == .consumed) any_consumed = true;
+        }
+    } else {
+        for (cx.slots) |*slot| {
+            if (event_is_some_slot_source and slot.engine.rule.src_usage != usage16) continue;
+            const result = slot.engine.feed(taphold_event);
+            applyTapHoldTimer(slot, result.timer);
+            if (result.disposition == .consumed) any_consumed = true;
+        }
     }
 
     // Apple firmware caps_lock neutralization. The proper fix
@@ -2036,7 +2161,7 @@ fn seizeInputCallback(ctx: ?*anyopaque, ev: HidSeize.Event) void {
     // CGEventSource API and, if Apple's firmware has toggled it,
     // inject a vhidd caps_lock toggle to flip it back. Visible as a
     // brief LED flash on long holds; clean otherwise.
-    if (usage16 == 0x39 and cx.caps_remap_active) {
+    if (usage16 == 0x39 and cx.caps_remap_active and (!scoped_route.scoped_source or scoped_route.selected != null)) {
         if (cx.hidsystem) |*hs| hs.setCapsLockState(false); // no-op when unsigned
         const flags = c.CGEventSourceFlagsState(c.kCGEventSourceStateHIDSystemState);
         if ((flags & c.kCGEventFlagMaskAlphaShift) != 0) {
@@ -2044,15 +2169,28 @@ fn seizeInputCallback(ctx: ?*anyopaque, ev: HidSeize.Event) void {
             // Apply the toggle to KbState so the next vhidd report
             // reflects it correctly, then post.
             _ = cx.state.applyKeyboardEvent(0x39, true);
-            cx.vhidd.postKeyboardReport(cx.state.modifiers, cx.state.compactedKeys()) catch {};
+            cx.vhidd.postKeyboardReport(cx.state.modifiers, cx.state.compactedKeys()) catch |err| handleVhiddPostError(cx, err);
             _ = cx.state.applyKeyboardEvent(0x39, false);
-            cx.vhidd.postKeyboardReport(cx.state.modifiers, cx.state.compactedKeys()) catch {};
+            if (!cx.vhidd_broken) {
+                cx.vhidd.postKeyboardReport(cx.state.modifiers, cx.state.compactedKeys()) catch |err| handleVhiddPostError(cx, err);
+            }
         }
     }
 
     if (any_consumed) return;
 
     emitToVhidd(@ptrCast(cx), taphold_event);
+}
+
+fn matchProbe(allocator: std.mem.Allocator, match: HidSeize.Match) !void {
+    const noop = struct {
+        fn callback(_: ?*anyopaque, _: HidSeize.Event) void {}
+    };
+    const matcher = try HidSeize.init(allocator, noop.callback, null);
+    defer matcher.deinit();
+    try matcher.setMatches(&.{match});
+    const count = matcher.previewMatchedCount();
+    log.info("match-probe: {d} matching keyboard(s) for 0x{X:0>4}:0x{X:0>4} (no device opened)", .{ count, match.vendor, match.product });
 }
 
 /// Open the vhidd virtual keyboard, seize the matched physical
@@ -2068,6 +2206,19 @@ fn seizeTest(
     rule: ?TapHold.Rule,
     profile: bool,
 ) !void {
+    if (mode == .observe) {
+        if (rule != null) return error.RuleNotSupportedInObserveMode;
+        const noop = struct {
+            fn callback(_: ?*anyopaque, _: HidSeize.Event) void {}
+        };
+        const observer = try HidSeize.init(allocator, noop.callback, null);
+        defer observer.deinit();
+        try observer.setMatches(&.{match});
+        try observer.start(.observe);
+        log.info("observe-only: {d} matching keyboard(s); no virtual keyboard or key reposting", .{observer.matchedCount()});
+        _ = c.CFRunLoopRunInMode(c.kCFRunLoopDefaultMode, @as(f64, @floatFromInt(duration_ms)) / 1000.0, 0);
+        return;
+    }
     log.info("seize-test: device 0x{X:0>4}:0x{X:0>4} for {d}ms (mode={s})", .{
         match.vendor,
         match.product,
@@ -2096,6 +2247,7 @@ fn seizeTest(
 
     log.info("initializing virtual keyboard", .{});
     try vhidd.initializeKeyboard(.{});
+    defer vhidd.sendRequest(.virtual_hid_keyboard_terminate) catch {};
     try vhidd.waitForBoolTrue(.virtual_hid_keyboard_ready, 5000);
     log.info("virtual keyboard ready", .{});
 
@@ -2247,23 +2399,34 @@ fn printHelp() void {
         \\  --socket-path <path>   Override IPC socket path
         \\                         (default: /var/run/skhd/grabber.sock)
         \\  --foreground           Run in foreground (logs to stderr)
+        \\  --experimental-app-scoped-rules
+        \\                         Allow app-scoped remaps on a separate --socket-path
         \\  -v, --version          Print version
         \\  -h, --help             Show this help
         \\
         \\Debug:
+        \\  --vhidd-probe          Connect to vhidd_server and disconnect without
+        \\                         initializing, injecting, or seizing a keyboard.
+        \\  --vhidd-ready-probe    Initialize and wait for virtual-keyboard
+        \\                         readiness without injecting or seizing keys.
+        \\  --vhidd-post-probe     Send F24 down/up through the virtual keyboard
+        \\                         without seizing the physical keyboard.
         \\  --inject-test-key      Connect to Karabiner vhidd_server, init the
-        \\                         virtual keyboard, send a single Escape
+        \\                         virtual keyboard, send a single 'a'
         \\                         keydown/up. Verifies the D2 injection path.
+        \\  --match-probe V:P      Count matching keyboards without opening,
+        \\                         seizing, or observing any device.
         \\  --seize-test V:P       Seize keyboard with vendor V product P (hex
         \\                         like 0x05AC:0x0342) and pass every keyboard
         \\                         event through vhidd unchanged. Auto-releases
         \\                         after --seize-test-duration seconds (default
         \\                         30). Verifies the D3 seize+pass-through path.
         \\  --seize-test-observe   Run --seize-test in passive observe mode
-        \\                         (kernel still receives the events too) for
-        \\                         diagnostics.
+        \\                         without root, virtual HID, key reposting,
+        \\                         or a tap-hold rule.
         \\  --seize-test-duration N
-        \\                         Seconds before --seize-test auto-releases.
+        \\                         Seconds before --seize-test auto-releases
+        \\                         (1–60, default 30).
         \\  --rule SRC:TAP:HOLD[@TIMEOUT_MS]
         \\                         Add one tap-hold rule active during
         \\                         --seize-test. Usages are HID page-7 codes

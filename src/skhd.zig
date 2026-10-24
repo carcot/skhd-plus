@@ -55,6 +55,7 @@ watchdog_timer: c.CFRunLoopTimerRef = null,
 /// the grabber. The Client owns the socket fd; Listener wraps it as a
 /// CFRunLoop source. Both freed on deinit.
 grabber_client: ?*agent_grabber_client.Client = null,
+grabber_socket_path: []const u8 = grabber_protocol.default_socket_path,
 layer_listener: ?*agent_layer_listener.Listener = null,
 /// Periodic retry timer for re-dialing the grabber after a
 /// disconnect. Null while connected (or when no rules need
@@ -307,8 +308,11 @@ fn forwardTapholdsToGrabber(self: *Skhd) !void {
         try rules.append(self.allocator, .{
             .src_usage = th.src_usage,
             .tap_usage = th.tap_usage,
+            .tap_modifier_usage = th.tap_modifier_usage,
             .hold_usage = th.hold_usage,
             .hold_layer = th.hold_layer,
+            .app_id = th.app_id,
+            .passthrough = th.passthrough,
             .device = .{ .vendor = alias.vendor, .product = alias.product },
             .timeout_ms = th.timeout_ms,
             .permissive_hold = th.permissive_hold,
@@ -342,7 +346,7 @@ fn forwardTapholdsToGrabber(self: *Skhd) !void {
 
     log.info(
         "forwarding {d} tap-hold rule(s) and {d} remap(s) to skhd-grabber at {s} (layer_listen={} fkeys_as_standard={})",
-        .{ rules.items.len, remaps.items.len, grabber_protocol.default_socket_path, has_layer_rule, fkeys_as_standard },
+        .{ rules.items.len, remaps.items.len, self.grabber_socket_path, has_layer_rule, fkeys_as_standard },
     );
 
     const client = try self.allocator.create(agent_grabber_client.Client);
@@ -350,15 +354,15 @@ fn forwardTapholdsToGrabber(self: *Skhd) !void {
     // The only place a failed connect is worth warning about: we are here
     // because the config HAS rules to forward, so the user asked for
     // something that isn't going to work. Probes elsewhere stay quiet.
-    client.* = agent_grabber_client.Client.connect(self.allocator, self.io, grabber_protocol.default_socket_path) catch |err| {
+    client.* = agent_grabber_client.Client.connect(self.allocator, self.io, self.grabber_socket_path) catch |err| {
         var buf: [256]u8 = undefined;
-        log.warn("{s}", .{agent_grabber_client.Client.connectErrorMessage(err, grabber_protocol.default_socket_path, &buf)});
+        log.warn("{s}", .{agent_grabber_client.Client.connectErrorMessage(err, self.grabber_socket_path, &buf)});
         return err;
     };
     errdefer client.close();
 
     try client.hello();
-    try client.applyRules(rules.items, remaps.items, fkeys_as_standard);
+    try client.applyRules(rules.items, remaps.items, fkeys_as_standard, self.carbon_event.getBundleId());
 
     // Always keep the connection open + watch it for EOS, regardless
     // of whether this config has layer rules. The grabber's per-
@@ -469,6 +473,16 @@ fn grabberDisconnected(ctx: ?*anyopaque) void {
     self.scheduleGrabberReconnect();
 }
 
+fn foregroundAppChanged(ctx: ?*anyopaque, app_id: ?[]const u8) void {
+    const self: *Skhd = @ptrCast(@alignCast(ctx orelse return));
+    if (self.grabber_client) |client| {
+        client.updateForegroundApp(app_id) catch |err| {
+            log.warn("foreground app update failed: {s}", .{@errorName(err)});
+            grabberDisconnected(ctx);
+        };
+    }
+}
+
 fn scheduleGrabberReconnect(self: *Skhd) void {
     if (self.grabber_reconnect_timer != null) return;
     var ctx = c.CFRunLoopTimerContext{
@@ -577,6 +591,8 @@ pub fn run(self: *Skhd, enable_hotload: bool) !void {
 
     // Store a global reference for the signal handler
     global_skhd = self;
+    self.carbon_event.on_change = foregroundAppChanged;
+    self.carbon_event.on_change_ctx = self;
 
     // Now that we hold a stable address for `self`, dial skhd-grabber
     // and forward any caps-class rules. We defer this from init() to

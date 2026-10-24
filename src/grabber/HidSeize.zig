@@ -50,11 +50,11 @@ const Predicate = struct {
 
 /// Decide what an alias matches.
 ///
-/// A FIFO/SPI built-in keyboard (vendor==0 and product==0) exposes no
-/// VendorID/ProductID in IOKit, so it can't be matched on VID/PID.
-/// IOHIDManager device-matching also ignores the `Built-In` key, so we
-/// scope the built-in to its internal-bus transports; external
-/// USB/Bluetooth keyboards then never enter the match.
+/// A (0,0) alias means the built-in keyboard regardless of whether
+/// IOKit reports its actual VendorID/ProductID. IOHIDManager
+/// device-matching ignores the `Built-In` key, so we scope the alias
+/// to internal-bus FIFO/SPI transports; external USB/Bluetooth
+/// keyboards then never enter the match.
 ///
 /// A real (vendor,product) alias targets that exact external device, so
 /// it matches on VID/PID and sets no transport constraint.
@@ -72,6 +72,10 @@ fn matchPredicate(m: Match) Predicate {
 pub const Event = struct {
     usage_page: u32,
     usage: u32,
+    device_id: u64 = 0,
+    device_vendor: u32 = 0,
+    device_product: u32 = 0,
+    device_known: bool = false,
     /// 1 for keydown / modifier set; 0 for keyup / modifier clear.
     /// Booleans abstract over IOHIDValueGetIntegerValue's CFIndex.
     pressed: bool,
@@ -90,6 +94,7 @@ manager: c.IOHIDManagerRef,
 callback: Callback,
 callback_ctx: ?*anyopaque,
 running: bool = false,
+matched_count: usize = 0,
 /// Open options actually applied to IOHIDManagerOpen. Tracked so
 /// stop() can mirror the same options on close.
 open_options: u32 = 0,
@@ -97,6 +102,7 @@ open_options: u32 = 0,
 /// disableCapsLockDelayOnMatches to filter event-system services
 /// to just the ones we seized.
 owned_matches: []Match = &.{},
+device_matches: std.AutoHashMapUnmanaged(u64, Match) = .empty,
 
 const Self = @This();
 
@@ -123,21 +129,21 @@ pub fn init(allocator: std.mem.Allocator, callback: Callback, callback_ctx: ?*an
 pub fn deinit(self: *Self) void {
     if (self.running) self.stop();
     if (self.owned_matches.len > 0) self.allocator.free(self.owned_matches);
+    self.device_matches.deinit(self.allocator);
     c.CFRelease(self.manager);
     instance = null;
     self.allocator.destroy(self);
 }
 
 /// Set one i32-valued key on a matching dict, creating and releasing
-/// the transient CFString key and CFNumber value. No-ops if a CF
-/// allocation fails (not expected for these tiny objects).
-fn setMatchKey(dict: c.CFMutableDictionaryRef, key_cstr: [*:0]const u8, value: i32) void {
+/// the transient CFString key and CFNumber value.
+fn setMatchKey(dict: c.CFMutableDictionaryRef, key_cstr: [*:0]const u8, value: i32) !void {
     const key = c.CFStringCreateWithCString(c.kCFAllocatorDefault, key_cstr, c.kCFStringEncodingUTF8);
-    if (key == null) return;
+    if (key == null) return error.CFStringCreateFailed;
     defer c.CFRelease(key);
     var v: i32 = value;
     const num = c.CFNumberCreate(c.kCFAllocatorDefault, c.kCFNumberSInt32Type, &v);
-    if (num == null) return;
+    if (num == null) return error.CFNumberCreateFailed;
     defer c.CFRelease(num);
     c.CFDictionarySetValue(dict, key, num);
 }
@@ -145,12 +151,12 @@ fn setMatchKey(dict: c.CFMutableDictionaryRef, key_cstr: [*:0]const u8, value: i
 /// Set one string-valued key on a matching dict (e.g. Transport="FIFO"),
 /// creating and releasing the transient CFString key and value. `value`
 /// must be a NUL-terminated UTF-8 literal.
-fn setMatchStrKey(dict: c.CFMutableDictionaryRef, key_cstr: [*:0]const u8, value: [*:0]const u8) void {
+fn setMatchStrKey(dict: c.CFMutableDictionaryRef, key_cstr: [*:0]const u8, value: [*:0]const u8) !void {
     const key = c.CFStringCreateWithCString(c.kCFAllocatorDefault, key_cstr, c.kCFStringEncodingUTF8);
-    if (key == null) return;
+    if (key == null) return error.CFStringCreateFailed;
     defer c.CFRelease(key);
     const val = c.CFStringCreateWithCString(c.kCFAllocatorDefault, value, c.kCFStringEncodingUTF8);
-    if (val == null) return;
+    if (val == null) return error.CFStringCreateFailed;
     defer c.CFRelease(val);
     c.CFDictionarySetValue(dict, key, val);
 }
@@ -174,11 +180,11 @@ fn appendMatchDict(
     if (dict == null) return error.CFDictionaryCreateFailed;
     defer c.CFRelease(dict);
 
-    if (vendor) |v| setMatchKey(dict, c.kIOHIDVendorIDKey, @intCast(v));
-    if (product) |p| setMatchKey(dict, c.kIOHIDProductIDKey, @intCast(p));
-    if (transport) |t| setMatchStrKey(dict, c.kIOHIDTransportKey, t.ptr);
-    setMatchKey(dict, c.kIOHIDPrimaryUsagePageKey, c.kHIDPage_GenericDesktop);
-    setMatchKey(dict, c.kIOHIDPrimaryUsageKey, c.kHIDUsage_GD_Keyboard);
+    if (vendor) |v| try setMatchKey(dict, c.kIOHIDVendorIDKey, @intCast(v));
+    if (product) |p| try setMatchKey(dict, c.kIOHIDProductIDKey, @intCast(p));
+    if (transport) |t| try setMatchStrKey(dict, c.kIOHIDTransportKey, t.ptr);
+    try setMatchKey(dict, c.kIOHIDPrimaryUsagePageKey, c.kHIDPage_GenericDesktop);
+    try setMatchKey(dict, c.kIOHIDPrimaryUsageKey, c.kHIDUsage_GD_Keyboard);
 
     c.CFArrayAppendValue(dicts, dict);
 }
@@ -207,6 +213,14 @@ pub fn setMatches(self: *Self, matches: []const Match) !void {
     const dicts = try buildMatchDicts(matches);
     defer c.CFRelease(dicts);
     c.IOHIDManagerSetDeviceMatchingMultiple(self.manager, dicts);
+}
+
+/// Inspect the configured match without opening any device. Unlike
+/// start(.observe), this works while another process owns the keyboard.
+pub fn previewMatchedCount(self: *Self) usize {
+    const matched = c.IOHIDManagerCopyDevices(self.manager) orelse return 0;
+    defer c.CFRelease(matched);
+    return @intCast(c.CFSetGetCount(matched));
 }
 
 /// Build the CFArray of matching dictionaries that filters the seize
@@ -273,7 +287,7 @@ pub fn start(self: *Self, mode: Mode) !void {
     const r = c.IOHIDManagerOpen(self.manager, self.open_options);
     if (r != c.kIOReturnSuccess) {
         c.IOHIDManagerUnscheduleFromRunLoop(self.manager, c.CFRunLoopGetCurrent(), c.kCFRunLoopDefaultMode);
-        log.err("IOHIDManagerOpen seize failed: 0x{X:0>8}", .{@as(u32, @bitCast(r))});
+        log.err("IOHIDManagerOpen {s} failed: 0x{X:0>8}", .{ @tagName(mode), @as(u32, @bitCast(r)) });
         return switch (r) {
             c.kIOReturnNotPrivileged => error.NotPrivileged,
             // kIOReturnNotPermitted: macOS TCC layer denied the
@@ -291,6 +305,7 @@ pub fn start(self: *Self, mode: Mode) !void {
 
     const matched = c.IOHIDManagerCopyDevices(self.manager);
     const count: usize = if (matched) |s| @intCast(c.CFSetGetCount(s)) else 0;
+    self.matched_count = count;
     log.info("seized matching devices (options=0x{x}, matched_count={d})", .{ self.open_options, count });
     if (count == 0) {
         log.warn("matching dictionary captured 0 devices — vendor/product mismatch?", .{});
@@ -389,7 +404,13 @@ pub fn stop(self: *Self) void {
     _ = c.IOHIDManagerClose(self.manager, self.open_options);
     c.IOHIDManagerUnscheduleFromRunLoop(self.manager, c.CFRunLoopGetCurrent(), c.kCFRunLoopDefaultMode);
     self.running = false;
+    self.matched_count = 0;
+    self.device_matches.clearRetainingCapacity();
     log.info("released seize", .{});
+}
+
+pub fn matchedCount(self: *const Self) usize {
+    return self.matched_count;
 }
 
 fn deviceIdsLog(prefix: []const u8, device: c.IOHIDDeviceRef) void {
@@ -413,15 +434,25 @@ fn deviceI32Property(device: c.IOHIDDeviceRef, key_cstr: [*:0]const u8) u32 {
     return @bitCast(out);
 }
 
+fn eventDeviceMatch(configured: []const Match, reported: Match) Match {
+    return if (configured.len == 1) configured[0] else reported;
+}
+
 fn deviceMatchedCallback(
     ctx: ?*anyopaque,
     result: c.IOReturn,
     sender: ?*anyopaque,
     device: c.IOHIDDeviceRef,
 ) callconv(.c) void {
-    _ = ctx;
     _ = sender;
     if (result != c.kIOReturnSuccess) return;
+    const self: *Self = @ptrCast(@alignCast(ctx orelse return));
+    const device_ptr = device orelse return;
+    const match: Match = .{
+        .vendor = deviceI32Property(device, c.kIOHIDVendorIDKey),
+        .product = deviceI32Property(device, c.kIOHIDProductIDKey),
+    };
+    self.device_matches.put(self.allocator, @intFromPtr(device_ptr), eventDeviceMatch(self.owned_matches, match)) catch return;
     deviceIdsLog("device matched", device);
 }
 
@@ -431,9 +462,10 @@ fn deviceRemovedCallback(
     sender: ?*anyopaque,
     device: c.IOHIDDeviceRef,
 ) callconv(.c) void {
-    _ = ctx;
     _ = sender;
     if (result != c.kIOReturnSuccess) return;
+    const self: *Self = @ptrCast(@alignCast(ctx orelse return));
+    if (device) |device_ptr| _ = self.device_matches.remove(@intFromPtr(device_ptr));
     deviceIdsLog("device removed", device);
 }
 
@@ -443,7 +475,6 @@ fn valueCallback(
     sender: ?*anyopaque,
     value: c.IOHIDValueRef,
 ) callconv(.c) void {
-    _ = sender;
     if (result != c.kIOReturnSuccess) return;
     const self: *Self = @ptrCast(@alignCast(ctx orelse return));
 
@@ -453,15 +484,29 @@ fn valueCallback(
     const usage_page = c.IOHIDElementGetUsagePage(element);
     const usage = c.IOHIDElementGetUsage(element);
     const int_value = c.IOHIDValueGetIntegerValue(value);
+    const device_id: u64 = if (sender) |device| @intFromPtr(device) else 0;
+    const match = self.device_matches.get(device_id);
 
     self.callback(self.callback_ctx, .{
         .usage_page = usage_page,
         .usage = usage,
+        .device_id = device_id,
+        .device_vendor = if (match) |device_match| device_match.vendor else 0,
+        .device_product = if (match) |device_match| device_match.product else 0,
+        .device_known = match != null,
         .pressed = int_value != 0,
     });
 }
 
 const testing = std.testing;
+
+test "single matched device reports its configured alias to rule selection" {
+    const builtin_alias = [_]Match{.{ .vendor = 0, .product = 0 }};
+    const reported: Match = .{ .vendor = 0x05ac, .product = 0x0343 };
+    try testing.expectEqual(builtin_alias[0], eventDeviceMatch(&builtin_alias, reported));
+    try testing.expectEqual(reported, eventDeviceMatch(&.{}, reported));
+    try testing.expectEqual(reported, eventDeviceMatch(&.{ builtin_alias[0], reported }, reported));
+}
 
 test "matchPredicate: FIFO built-in (0,0) scopes to internal transports, omits VID/PID" {
     // The bug this guards: a (0,0) alias must NOT match every keyboard by

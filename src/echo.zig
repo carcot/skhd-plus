@@ -14,7 +14,7 @@ pub fn echo(io: std.Io) !void {
         (1 << c.kCGEventRightMouseDown) |
         (1 << c.kCGEventOtherMouseDown) |
         (1 << c.NX_SYSDEFINED);
-    var event_tap = EventTap{ .mask = mask };
+    var event_tap = EventTap{ .mask = mask, .options = c.kCGEventTapOptionListenOnly };
     defer event_tap.deinit();
     std.debug.print("Ctrl+C to exit\n", .{});
     try event_tap.begin(io, callback, null);
@@ -25,13 +25,13 @@ fn callback(_: c.CGEventTapProxy, typ: c.CGEventType, event: c.CGEventRef, _: ?*
     switch (typ) {
         c.kCGEventKeyDown => return printKeydown(event) catch |err| {
             std.debug.print("Error: {}\n", .{err});
-            return @ptrFromInt(0);
+            return event;
         },
         // c.kCGEventFlagsChanged => printFlagsChanged(event),
         c.kCGEventLeftMouseDown, c.kCGEventRightMouseDown, c.kCGEventOtherMouseDown => {
             const button = c.CGEventGetIntegerValueField(event, c.kCGMouseEventButtonNumber);
             std.debug.print("Mouse button: {d}\n", .{button});
-            return @ptrFromInt(0);
+            return event;
         },
         c.NX_SYSDEFINED => {
             printSystemKey(event);
@@ -114,7 +114,7 @@ fn printKeydown(event: c.CGEventRef) !c.CGEventRef {
     // const s = std.mem.sliceTo(buffer[0..], 0);
     // std.debug.print("\t{s}\tkeycode: 0x{x:0<2}\n", .{ s, keycode });
 
-    return @ptrFromInt(0);
+    return event;
 }
 
 fn translateKey(buffer: *[255]u8, keyCode: u16, modifierState: u32) !void {

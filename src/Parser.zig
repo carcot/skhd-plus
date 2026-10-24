@@ -8,6 +8,7 @@ const Mode = @import("Mode.zig");
 const Mappings = @import("Mappings.zig");
 const Keycodes = @import("Keycodes.zig");
 const HidKeyMap = @import("HidKeyMap.zig");
+const BundleId = @import("grabber/BundleId.zig");
 const utils = @import("utils.zig");
 const ModifierFlag = @import("Keycodes.zig").ModifierFlag;
 const ParseError = @import("ParseError.zig").ParseError;
@@ -1496,11 +1497,33 @@ fn parse_remap_decl(self: *Parser, mappings: *Mappings) !void {
         return error.ParseErrorOccurred;
     }
 
+    var app_id: ?[]const u8 = null;
+    if (self.match(.Token_BeginList)) {
+        if (!self.match(.Token_Identifier) or !std.mem.eql(u8, self.previous().text, "app")) {
+            self.error_info = try ParseError.fromToken(self.allocator, self.previous(), "Expected 'app' after device guard", self.current_file_path);
+            return error.ParseErrorOccurred;
+        }
+        if (!self.match(.Token_String)) {
+            self.error_info = try ParseError.fromToken(self.allocator, self.peek() orelse self.previous(), "Expected quoted bundle ID after 'app'", self.current_file_path);
+            return error.ParseErrorOccurred;
+        }
+        const app_token = self.previous();
+        if (!BundleId.valid(app_token.text)) {
+            self.error_info = try ParseError.fromToken(self.allocator, app_token, "Invalid bundle ID in app guard", self.current_file_path);
+            return error.ParseErrorOccurred;
+        }
+        if (!self.match(.Token_EndList)) {
+            self.error_info = try ParseError.fromToken(self.allocator, self.peek() orelse self.previous(), "Expected ']' to close app guard", self.current_file_path);
+            return error.ParseErrorOccurred;
+        }
+        app_id = app_token.text;
+    }
+
     // Branch: colon form (`.remap X [device d] : Y`) vs block form
     // (`.remap X [device d] { tap: ..., hold: ..., ... }`).
     if (self.peek_check(.Token_BeginBlock)) {
         _ = self.advance();
-        try self.parse_remap_block_body(mappings, src_token, src_usage, alias_name);
+        try self.parse_remap_block_body(mappings, src_token, src_usage, alias_name, app_id);
         return;
     }
 
@@ -1515,6 +1538,26 @@ fn parse_remap_decl(self: *Parser, mappings: *Mappings) !void {
     const dst_name = std.mem.trim(u8, dst_token.text, " \t");
     if (dst_name.len == 0) {
         self.error_info = try ParseError.fromToken(self.allocator, dst_token, "Empty destination — expected a key name (e.g., lctrl)", self.current_file_path);
+        return error.ParseErrorOccurred;
+    }
+    if (std.mem.eql(u8, dst_name, "passthrough") and app_id != null) {
+        mappings.add_taphold(.{
+            .src_usage = src_usage,
+            .tap_usage = 0,
+            .device_alias = alias_name,
+            .app_id = app_id,
+            .passthrough = true,
+        }) catch |err| {
+            if (err == error.RemapConflict) {
+                self.error_info = try ParseError.fromToken(self.allocator, src_token, "Duplicate app-scoped remap for this source and device", self.current_file_path);
+                return error.ParseErrorOccurred;
+            }
+            return err;
+        };
+        return;
+    }
+    if (app_id != null) {
+        self.error_info = try ParseError.fromToken(self.allocator, dst_token, "App-scoped colon form only supports 'passthrough'; use a tap-hold block for other actions", self.current_file_path);
         return error.ParseErrorOccurred;
     }
     const dst_usage = HidKeyMap.lookup(dst_name) orelse {
@@ -1539,8 +1582,9 @@ fn parse_remap_decl(self: *Parser, mappings: *Mappings) !void {
 
 /// Parse the body of `.remap X [device d] { ... }`. The opening `{`
 /// has already been consumed.
-fn parse_remap_block_body(self: *Parser, mappings: *Mappings, src_token: Token, src_usage: u32, alias_name: []const u8) !void {
+fn parse_remap_block_body(self: *Parser, mappings: *Mappings, src_token: Token, src_usage: u32, alias_name: []const u8, app_id: ?[]const u8) !void {
     var tap_usage: ?u32 = null;
+    var tap_modifier_usage: u32 = 0;
     var hold_usage: ?u32 = null;
     var hold_target_text: []const u8 = "";
     var timeout_ms: u32 = 200;
@@ -1551,7 +1595,7 @@ fn parse_remap_block_body(self: *Parser, mappings: *Mappings, src_token: Token, 
     while (!self.match(.Token_EndBlock)) {
         if (!self.match(.Token_Identifier)) {
             const token = self.peek() orelse self.previous();
-            self.error_info = try ParseError.fromToken(self.allocator, token, "Expected field name (tap, hold, timeout, permissive_hold, hold_on_other_key_press, retro_tap) or '}'", self.current_file_path);
+            self.error_info = try ParseError.fromToken(self.allocator, token, "Expected field name (tap, tap_modifier, hold, timeout, permissive_hold, hold_on_other_key_press, retro_tap) or '}'", self.current_file_path);
             return error.ParseErrorOccurred;
         }
         const field_token = self.previous();
@@ -1567,6 +1611,12 @@ fn parse_remap_block_body(self: *Parser, mappings: *Mappings, src_token: Token, 
 
         if (std.mem.eql(u8, field, "tap")) {
             tap_usage = try self.parse_keysym_value();
+        } else if (std.mem.eql(u8, field, "tap_modifier")) {
+            tap_modifier_usage = try self.parse_keysym_value();
+            if (tap_modifier_usage < 0xE0 or tap_modifier_usage > 0xE7) {
+                self.error_info = try ParseError.fromToken(self.allocator, field_token, "tap_modifier must be a HID modifier key", self.current_file_path);
+                return error.ParseErrorOccurred;
+            }
         } else if (std.mem.eql(u8, field, "hold")) {
             // Capture the raw token text so we can emit a clear
             // "layer holds aren't wired up yet" diagnostic for things
@@ -1589,7 +1639,7 @@ fn parse_remap_block_body(self: *Parser, mappings: *Mappings, src_token: Token, 
         } else if (std.mem.eql(u8, field, "retro_tap")) {
             retro_tap = try self.parse_bool_on_off();
         } else {
-            const msg = try std.fmt.allocPrint(self.allocator, "Unknown field '{s}' in .remap block. Supported: tap, hold, timeout, permissive_hold, hold_on_other_key_press, retro_tap", .{field});
+            const msg = try std.fmt.allocPrint(self.allocator, "Unknown field '{s}' in .remap block. Supported: tap, tap_modifier, hold, timeout, permissive_hold, hold_on_other_key_press, retro_tap", .{field});
             defer self.allocator.free(msg);
             self.error_info = try ParseError.fromToken(self.allocator, field_token, msg, self.current_file_path);
             return error.ParseErrorOccurred;
@@ -1617,9 +1667,11 @@ fn parse_remap_block_body(self: *Parser, mappings: *Mappings, src_token: Token, 
     mappings.add_taphold(.{
         .src_usage = src_usage,
         .tap_usage = tap_usage.?,
+        .tap_modifier_usage = tap_modifier_usage,
         .hold_usage = hold_usage orelse 0,
         .hold_layer = hold_layer,
         .device_alias = alias_name,
+        .app_id = app_id,
         .timeout_ms = timeout_ms,
         .permissive_hold = permissive_hold,
         .hold_on_other_key_press = hold_on_other_key_press,
@@ -2451,6 +2503,70 @@ test "tap-hold timeout accepts ms and s suffixes" {
     try std.testing.expectEqual(@as(usize, 2), mappings.tapholds.items.len);
     try std.testing.expectEqual(@as(u32, 1000), mappings.tapholds.items[0].timeout_ms);
     try std.testing.expectEqual(@as(u32, 250), mappings.tapholds.items[1].timeout_ms);
+}
+
+test "tap modifier accepts only HID modifiers" {
+    var parser = try Parser.init(std.testing.allocator, std.testing.io);
+    defer parser.deinit();
+    var mappings = try Mappings.init(std.testing.allocator, std.testing.io);
+    defer mappings.deinit();
+
+    try parser.parse(&mappings,
+        \\.device builtin { vendor: 0x05AC, product: 0x0343 }
+        \\.remap rcmd [device builtin] { tap: f19, tap_modifier: rcmd, hold: rcmd }
+    );
+    try std.testing.expectEqual(@as(usize, 1), mappings.tapholds.items.len);
+    try std.testing.expectEqual(@as(u32, 0x6E), mappings.tapholds.items[0].tap_usage);
+    try std.testing.expectEqual(@as(u32, 0xE7), mappings.tapholds.items[0].tap_modifier_usage);
+
+    try std.testing.expectError(error.ParseErrorOccurred, parser.parse(&mappings,
+        \\.remap ralt [device builtin] { tap: f19, tap_modifier: a, hold: ralt }
+    ));
+}
+
+test "app-scoped remaps parse exact guards and passthrough" {
+    var parser = try Parser.init(std.testing.allocator, std.testing.io);
+    defer parser.deinit();
+    var mappings = try Mappings.init(std.testing.allocator, std.testing.io);
+    defer mappings.deinit();
+
+    try parser.parse(&mappings,
+        \\.device builtin { vendor: 0x05AC, product: 0x0342 }
+        \\.remap caps_lock [device builtin] {
+        \\    tap: escape
+        \\    hold: lctrl
+        \\}
+        \\.remap caps_lock [device builtin] [app "com.mitchellh.ghostty"] {
+        \\    tap: f20
+        \\    hold: rctrl
+        \\}
+        \\.remap caps_lock [device builtin] [app "org.gnu.Emacs"] : passthrough
+    );
+
+    try std.testing.expectEqual(@as(usize, 3), mappings.tapholds.items.len);
+    try std.testing.expect(mappings.tapholds.items[0].app_id == null);
+    try std.testing.expectEqualStrings("com.mitchellh.ghostty", mappings.tapholds.items[1].app_id.?);
+    try std.testing.expectEqualStrings("org.gnu.Emacs", mappings.tapholds.items[2].app_id.?);
+    try std.testing.expect(mappings.tapholds.items[2].passthrough);
+}
+
+test "app-scoped remaps reject duplicate and malformed guards" {
+    const prefix = ".device builtin { vendor: 0x05AC, product: 0x0342 }\n";
+    const cases = [_][]const u8{
+        ".remap caps_lock [device builtin] [app \"org.gnu.Emacs\"] : passthrough\n.remap caps_lock [device builtin] [app \"org.gnu.Emacs\"] : passthrough",
+        ".remap caps_lock [device builtin] [app \"bad bundle\"] : passthrough",
+        ".remap caps_lock [device builtin] [app \"org.gnu.Emacs\"] : lctrl",
+        ".remap caps_lock [device builtin] [app org.gnu.Emacs] : passthrough",
+    };
+    for (cases) |body| {
+        var parser = try Parser.init(std.testing.allocator, std.testing.io);
+        defer parser.deinit();
+        var mappings = try Mappings.init(std.testing.allocator, std.testing.io);
+        defer mappings.deinit();
+        const content = try std.mem.concat(std.testing.allocator, u8, &.{ prefix, body });
+        defer std.testing.allocator.free(content);
+        try std.testing.expectError(error.ParseErrorOccurred, parser.parse(&mappings, content));
+    }
 }
 
 test "duration suffix must be on the same line as the number" {

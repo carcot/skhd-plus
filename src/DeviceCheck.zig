@@ -67,6 +67,7 @@ extern fn IOHIDDeviceGetProperty(device: IOHIDDeviceRef, key: CFStringRef) ?*any
 const kIOHIDVendorIDKey: [*:0]const u8 = "VendorID";
 const kIOHIDProductIDKey: [*:0]const u8 = "ProductID";
 const kIOHIDProductKey: [*:0]const u8 = "Product";
+const kIOHIDTransportKey: [*:0]const u8 = "Transport";
 /// IOKit usage match keys. We use the `Primary*` variants here for
 /// consistency with `HidSeize.setMatches` and `Hidutil.buildMatching`,
 /// so all three matching paths see the same set of devices for a given
@@ -79,6 +80,10 @@ const kIOHIDPrimaryUsageKey: [*:0]const u8 = "PrimaryUsage";
 /// the standard "this device is a keyboard" pair.
 const usage_page_generic_desktop: i32 = 1;
 const usage_keyboard: i32 = 6;
+
+fn isBuiltinTransport(transport: []const u8) bool {
+    return std.mem.eql(u8, transport, "FIFO") or std.mem.eql(u8, transport, "SPI");
+}
 
 /// True when at least one HID device matching `(vendor, product)` is
 /// currently connected. False when the lookup failed too — callers
@@ -97,10 +102,9 @@ pub fn isPresent(vendor: u32, product: u32) bool {
     if (dict == null) return false;
     defer CFRelease(dict);
 
-    // FIFO-transport built-in keyboards don't expose VendorID/ProductID
-    // in IOKit. Including them with value 0 requires the property to
-    // *exist* on the device, so 0 devices match. Match by usage only
-    // and confirm a VID-less keyboard exists.
+    // A (0,0) alias identifies internal-bus built-in keyboards by
+    // transport rather than VID/PID. Match by usage first, then inspect
+    // each candidate's transport below.
     if (vendor != 0 or product != 0) {
         const v_key = CFStringCreateWithCString(kCFAllocatorDefault, kIOHIDVendorIDKey, kCFStringEncodingUTF8);
         if (v_key == null) return false;
@@ -154,21 +158,22 @@ pub fn isPresent(vendor: u32, product: u32) bool {
 
     if (vendor != 0 or product != 0) return count > 0;
 
-    // For 0/0: broad match includes the VHIDD. Confirm at least one
-    // matched device lacks a VendorID property (FIFO built-in keyboard).
+    // For 0/0: broad match includes the VHIDD. Confirm an internal-bus
+    // keyboard instead of assuming built-ins have no VendorID property.
     if (count <= 0) return false;
     const n: usize = @intCast(count);
     const buf = std.heap.c_allocator.alloc(?*const anyopaque, n) catch return false;
     defer std.heap.c_allocator.free(buf);
     CFSetGetValues(matched, buf.ptr);
 
-    const vid_key = CFStringCreateWithCString(kCFAllocatorDefault, kIOHIDVendorIDKey, kCFStringEncodingUTF8);
-    if (vid_key == null) return false;
-    defer CFRelease(vid_key);
+    const transport_key = CFStringCreateWithCString(kCFAllocatorDefault, kIOHIDTransportKey, kCFStringEncodingUTF8);
+    if (transport_key == null) return false;
+    defer CFRelease(transport_key);
 
+    var transport_buf: [32]u8 = undefined;
     for (buf) |ref_const| {
         const dev: IOHIDDeviceRef = @constCast(ref_const);
-        if (IOHIDDeviceGetProperty(dev, vid_key) == null) return true;
+        if (isBuiltinTransport(readStringProp(dev, transport_key, &transport_buf))) return true;
     }
     return false;
 }
@@ -370,6 +375,19 @@ test "slugify: common product names" {
     try std.testing.expectEqualStrings("magic_keyboard_a1843", slugify(&buf, "  Magic Keyboard - A1843  "));
     try std.testing.expectEqualStrings("", slugify(&buf, "***"));
     try std.testing.expectEqualStrings("", slugify(&buf, ""));
+}
+
+test "built-in transport excludes external and virtual keyboards" {
+    try std.testing.expect(isBuiltinTransport("FIFO"));
+    try std.testing.expect(isBuiltinTransport("SPI"));
+    try std.testing.expect(!isBuiltinTransport("USB"));
+    try std.testing.expect(!isBuiltinTransport("Bluetooth"));
+    try std.testing.expect(!isBuiltinTransport(""));
+}
+
+test "live built-in keyboard presence" {
+    if (std.c.getenv("SKHD_HID_LIVE") == null) return error.SkipZigTest;
+    try std.testing.expect(isPresent(0, 0));
 }
 
 test "slugify: truncation respects buffer bounds" {

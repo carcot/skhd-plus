@@ -11,7 +11,7 @@ pub const default_socket_path = "/var/run/skhd/grabber.sock";
 
 /// Protocol version exchanged in `hello`. Bump when wire format changes
 /// in a non-backwards-compatible way.
-pub const protocol_version: u32 = 2;
+pub const protocol_version: u32 = 4;
 
 /// Maximum size of a single framed message body (1 MiB). Guards against
 /// runaway frames on a misbehaving peer.
@@ -52,11 +52,14 @@ pub const Rule = struct {
     src_usage: u32,
     /// HID usage emitted on tap.
     tap_usage: u32,
+    tap_modifier_usage: u32 = 0,
     /// HID usage emitted on hold. Zero when `hold_layer` is set.
     hold_usage: u32 = 0,
     /// Mode name to push on hold; null when `hold_usage` is set.
     /// Owned by the wire payload's arena (parsed-from-JSON lifetime).
     hold_layer: ?[]const u8 = null,
+    app_id: ?[]const u8 = null,
+    passthrough: bool = false,
     /// Optional device filter; null means "all keyboards".
     device: ?Device = null,
     /// Tap-hold timeout in milliseconds.
@@ -118,7 +121,7 @@ test "writeMessage produces parseable JSON" {
     var w = std.Io.Writer.fixed(&pipe_buf);
 
     try writeMessage(&w, std.testing.allocator, .{
-        .@"type" = "hello",
+        .type = "hello",
         .uid = @as(u32, 501),
         .version = protocol_version,
     });
@@ -133,4 +136,30 @@ test "writeMessage produces parseable JSON" {
     const obj = parsed.value.object;
     try std.testing.expectEqualStrings("hello", obj.get("type").?.string);
     try std.testing.expectEqual(@as(i64, 501), obj.get("uid").?.integer);
+}
+
+test "app-scoped rule fields survive JSON framing" {
+    var pipe_buf: [512]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&pipe_buf);
+    const rule: Rule = .{
+        .src_usage = 0x39,
+        .tap_usage = 0,
+        .tap_modifier_usage = 0xE7,
+        .hold_usage = 0,
+        .device = .{ .vendor = 5, .product = 6 },
+        .app_id = "org.gnu.Emacs",
+        .passthrough = true,
+    };
+    try writeMessage(&writer, std.testing.allocator, .{ .type = "apply_rules", .rules = &[_]Rule{rule} });
+
+    var reader = std.Io.Reader.fixed(writer.buffered());
+    var read_buf: [512]u8 = undefined;
+    const len = try readFrame(&reader, &read_buf);
+    const Message = struct { type: []const u8, rules: []Rule };
+    var parsed = try std.json.parseFromSlice(Message, std.testing.allocator, read_buf[0..len], .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("apply_rules", parsed.value.type);
+    try std.testing.expectEqualStrings("org.gnu.Emacs", parsed.value.rules[0].app_id.?);
+    try std.testing.expectEqual(@as(u32, 0xE7), parsed.value.rules[0].tap_modifier_usage);
+    try std.testing.expect(parsed.value.rules[0].passthrough);
 }

@@ -4,6 +4,7 @@ const c = @import("c.zig");
 handle: c.CFMachPortRef = null,
 runloop_source: c.CFRunLoopSourceRef = null,
 mask: c.CGEventMask,
+options: c.CGEventTapOptions = c.kCGEventTapOptionDefault,
 
 const EventTap = @This();
 const log = std.log.scoped(.event_tap);
@@ -25,7 +26,7 @@ pub fn begin(self: *EventTap, io: std.Io, callback: c.CGEventTapCallBack, user_i
     var attempt: u8 = 0;
     while (attempt < max_attempts) : (attempt += 1) {
         self.handle = c.CGEventTapCreate(c.kCGSessionEventTap, c.kCGHeadInsertEventTap, //
-            c.kCGEventTapOptionDefault, self.mask, callback, user_info);
+            self.options, self.mask, callback, user_info);
         if (self.enabled()) {
             self.runloop_source = c.CFMachPortCreateRunLoopSource(c.kCFAllocatorDefault, self.handle, 0);
             c.CFRunLoopAddSource(c.CFRunLoopGetMain(), self.runloop_source, c.kCFRunLoopCommonModes);

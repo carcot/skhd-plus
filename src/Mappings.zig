@@ -59,6 +59,7 @@ pub const TapHoldDecl = struct {
     /// HID usage byte of the action emitted on a quick tap (e.g.,
     /// escape).
     tap_usage: u32,
+    tap_modifier_usage: u32 = 0,
     /// HID usage byte of the action committed on hold (e.g., lctrl).
     /// Zero when `hold_layer` is set instead.
     hold_usage: u32 = 0,
@@ -68,6 +69,8 @@ pub const TapHoldDecl = struct {
     hold_layer: ?[]const u8 = null,
     /// Required device alias (same rationale as RemapDecl). Owned.
     device_alias: []const u8,
+    app_id: ?[]const u8 = null,
+    passthrough: bool = false,
     /// Tap-vs-hold decision deadline in milliseconds. Default 200 if
     /// unspecified by the user.
     timeout_ms: u32 = 200,
@@ -126,6 +129,7 @@ pub fn deinit(self: *Mappings) void {
     for (self.tapholds.items) |t| {
         self.allocator.free(t.device_alias);
         if (t.hold_layer) |l| self.allocator.free(l);
+        if (t.app_id) |app_id| self.allocator.free(app_id);
     }
     self.tapholds.deinit(self.allocator);
     self.allocator.free(self.shell);
@@ -184,7 +188,7 @@ pub fn add_device_alias(self: *Mappings, name: []const u8, vendor: u32, product:
 
 pub fn add_remap(self: *Mappings, src_usage: u32, dst_usage: u32, device_alias: []const u8) !void {
     // Same source key for the same device cannot be remapped twice.
-    if (self.findRemapOrTaphold(src_usage, device_alias)) {
+    if (self.findRemapOrTaphold(src_usage, device_alias, null, true)) {
         return error.RemapConflict;
     }
     const owned_alias = try self.allocator.dupe(u8, device_alias);
@@ -197,7 +201,7 @@ pub fn add_remap(self: *Mappings, src_usage: u32, dst_usage: u32, device_alias: 
 }
 
 pub fn add_taphold(self: *Mappings, decl: TapHoldDecl) !void {
-    if (self.findRemapOrTaphold(decl.src_usage, decl.device_alias)) {
+    if (self.findRemapOrTaphold(decl.src_usage, decl.device_alias, decl.app_id, false)) {
         return error.RemapConflict;
     }
     const owned_alias = try self.allocator.dupe(u8, decl.device_alias);
@@ -207,9 +211,15 @@ pub fn add_taphold(self: *Mappings, decl: TapHoldDecl) !void {
     else
         null;
     errdefer if (owned_layer) |l| self.allocator.free(l);
+    const owned_app_id: ?[]const u8 = if (decl.app_id) |app_id|
+        try self.allocator.dupe(u8, app_id)
+    else
+        null;
+    errdefer if (owned_app_id) |app_id| self.allocator.free(app_id);
     var d = decl;
     d.device_alias = owned_alias;
     d.hold_layer = owned_layer;
+    d.app_id = owned_app_id;
     try self.tapholds.append(self.allocator, d);
 }
 
@@ -217,12 +227,15 @@ pub fn add_taphold(self: *Mappings, decl: TapHoldDecl) !void {
 /// or `.remap { ... }` block. Used by both add_remap and add_taphold to
 /// reject ambiguous configurations like a colon-form and a block-form
 /// targeting the same physical key on the same device.
-fn findRemapOrTaphold(self: *const Mappings, src_usage: u32, device_alias: []const u8) bool {
+fn findRemapOrTaphold(self: *const Mappings, src_usage: u32, device_alias: []const u8, app_id: ?[]const u8, simple_remap: bool) bool {
     for (self.remaps.items) |existing| {
         if (existing.src_usage == src_usage and std.mem.eql(u8, existing.device_alias, device_alias)) return true;
     }
     for (self.tapholds.items) |existing| {
-        if (existing.src_usage == src_usage and std.mem.eql(u8, existing.device_alias, device_alias)) return true;
+        if (existing.src_usage != src_usage or !std.mem.eql(u8, existing.device_alias, device_alias)) continue;
+        if (simple_remap) return true;
+        if (existing.app_id == null and app_id == null) return true;
+        if (existing.app_id != null and app_id != null and std.mem.eql(u8, existing.app_id.?, app_id.?)) return true;
     }
     return false;
 }
@@ -363,6 +376,34 @@ test "add_taphold accepts distinct src or distinct device" {
     try std.testing.expectEqual(@as(usize, 3), mappings.tapholds.items.len);
     try std.testing.expectEqual(@as(u32, 120), mappings.tapholds.items[0].timeout_ms);
     try std.testing.expectEqual(true, mappings.tapholds.items[2].retro_tap);
+}
+
+test "app-scoped tapholds allow distinct apps and one fallback" {
+    var mappings = try Mappings.init(std.testing.allocator, std.testing.io);
+    defer mappings.deinit();
+
+    const base: TapHoldDecl = .{
+        .src_usage = 0x39,
+        .tap_usage = 0x29,
+        .hold_usage = 0xE0,
+        .device_alias = "builtin",
+    };
+    try mappings.add_taphold(base);
+
+    var ghostty = base;
+    ghostty.app_id = "com.mitchellh.ghostty";
+    try mappings.add_taphold(ghostty);
+
+    var emacs = base;
+    emacs.app_id = "org.gnu.Emacs";
+    emacs.passthrough = true;
+    try mappings.add_taphold(emacs);
+
+    try std.testing.expectError(error.RemapConflict, mappings.add_taphold(base));
+    try std.testing.expectError(error.RemapConflict, mappings.add_taphold(ghostty));
+    try std.testing.expectError(error.RemapConflict, mappings.add_taphold(emacs));
+    try std.testing.expectError(error.RemapConflict, mappings.add_remap(0x39, 0xE0, "builtin"));
+    try std.testing.expectEqual(@as(usize, 3), mappings.tapholds.items.len);
 }
 
 test "add_remap returns error on duplicate src+device" {

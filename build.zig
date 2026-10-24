@@ -123,7 +123,7 @@ const track_alloc_option = "track_alloc";
 //   2. Update _url accordingly.
 //   3. `curl -fsSL <url> | shasum -a 256` and paste into _sha256.
 //   4. Test `zig build install-dext` end-to-end on a clean machine.
-const karabiner_dext_version = "6.14.0";
+const karabiner_dext_version = "8.5.0";
 const karabiner_dext_url = "https://github.com/pqrs-org/Karabiner-DriverKit-VirtualHIDDevice/releases/download/v" ++ karabiner_dext_version ++ "/Karabiner-DriverKit-VirtualHIDDevice-" ++ karabiner_dext_version ++ ".pkg";
 const karabiner_dext_sha256 = "ebfb6a643ea98bb7c2e08a4f99353b2a3129e397f4302340443bbd936f12eb1c";
 
@@ -540,6 +540,7 @@ pub fn build(b: *std.Build) void {
         "src/Tokenizer.zig",
         "src/Parser.zig",
         "src/Mappings.zig",
+        "src/CarbonEvent.zig",
         "src/Keycodes.zig",
         "src/EventTap.zig",
         "src/DeviceCheck.zig",
@@ -548,6 +549,11 @@ pub fn build(b: *std.Build) void {
         "src/grabber_cli.zig",
         "src/grabber_protocol.zig",
         "src/grabber/Vhidd.zig",
+        "src/grabber/VhiddStream.zig",
+        "src/grabber/AppRuleSelector.zig",
+        "src/grabber/ForegroundUpdate.zig",
+        "src/grabber/BundleId.zig",
+        "src/grabber/Ipc.zig",
         "src/grabber/KbState.zig",
         "src/grabber/TapHold.zig",
         "src/grabber/HidSeize.zig",

@@ -6,6 +6,42 @@ This implementation is **fully compatible with the original skhd configuration f
 
 📋 [View Changelog](CHANGELOG.md)
 
+## This fork: app-specific low-level remaps
+
+The `carcot` fork adds **per-application tap/hold remapping** to the
+system-level grabber. Rules select the frontmost app by its exact macOS bundle
+ID, so the same physical key can have a different tap or hold action in
+Ghostty, Terminal, or another app. An app can also explicitly pass a key
+through unchanged. For example:
+
+```text
+.device builtin { vendor: 0x05AC, product: 0x0343 }
+
+.remap caps_lock [device builtin] {
+    tap: f20
+    hold: lcmd
+}
+.remap caps_lock [device builtin] [app "com.mitchellh.ghostty"] {
+    tap: f20
+    hold: rctrl
+}
+.remap caps_lock [device builtin] [app "org.gnu.Emacs"] : passthrough
+```
+
+The fork also updates the virtual-keyboard transport for Karabiner DriverKit
+8.5, sends foreground-app changes from the user agent to the grabber, selects
+only one matching rule per physical key, and reconnects/reapplies rules after
+a grabber disconnect. The device guard remains required. Ordinary high-level
+hotkeys still use the existing skhd syntax and do not need the grabber.
+
+**Release status:** app-scoped rules are deliberately opt-in. The grabber must
+run with `--experimental-app-scoped-rules` on a separate `--socket-path`, and
+the agent must use that socket with `--grabber-socket`. A plain
+`skhd --install-service` does not enable this feature. The bundled app contains
+both binaries; see [fork setup and limitations](docs/FORK_RELEASE.md) before
+installing it. This fork still depends on the Karabiner DriverKit virtual-HID
+component, though Karabiner's keyboard-owning user agents can be disabled.
+
 ## v0.2.0 — Hotkey sequences
 
 Bind a run of chords to one action, fired only when the chords arrive in order within a time budget (default 300ms, set with `.sequence_timeout`):
@@ -785,12 +821,13 @@ on a machine that doesn't need them.
   VHIDD daemon launchd label (`org.pqrs.service.daemon.Karabiner-VirtualHIDDevice-Daemon`)
   via `SMAppService.daemon`, so we share that piece — `--install-dext`
   detects KE's registration and skips writing our own plist. But the
-  *grabber* layer (`karabiner_grabber` for KE, `skhd-grabber` for us)
-  still wants exclusive seize on the same keyboard. If you're running
-  Karabiner-Elements, disable its grabber
-  (`sudo launchctl bootout system/org.pqrs.service.daemon.karabiner_grabber`)
-  before starting `skhd-grabber`. `skhd --status` and
-  `--install-grabber` flag this conflict when detected.
+  *grabber* layer (Karabiner Core Service on current installations,
+  `skhd-grabber` for us) still wants exclusive seize on the same keyboard.
+  Older instructions to boot out `org.pqrs.service.daemon.karabiner_grabber`
+  do not apply to every Karabiner version. Verify the actual installed
+  service and a working rollback before disabling Karabiner or starting
+  `skhd-grabber`, especially on a Mac with no second keyboard. `skhd
+  --status` and `--install-grabber` do not establish that rollback.
 - **F-row behavior**: with macOS's "Use F1, F2..." setting **off**
   (default), the grabber translates F1..F12 keyboard events to the
   appropriate Consumer / Apple-Vendor media events (volume,
@@ -878,7 +915,7 @@ If you've configured a custom keyboard in QMK, you already know how every knob i
 
 skhd-grabber and Karabiner-Elements both want exclusive HID seize on the same keyboard, so running both grabbers at once doesn't work. We coexist at the **DriverKit daemon** layer (we share the same `org.pqrs.service.daemon.Karabiner-VirtualHIDDevice-Daemon` registration; if Karabiner-Elements is installed, our `--install-dext` detects its SMAppService registration and skips writing our own plist), but you have to pick **one grabber** at a time. See the Coexistence caveat above for the disable command.
 
-If you're switching from Karabiner-Elements to skhd.zig: keep the dext, keep the daemon, just disable `karabiner_grabber`. If you want to go back the other way: `sudo skhd --uninstall-grabber` and re-enable Karabiner-Elements.
+If you're switching from Karabiner-Elements to skhd.zig: keep the dext and its daemon, but verify the installed Karabiner service and a timed recovery path before changing exclusive keyboard ownership. To switch back, stop the skhd grabber and restore Karabiner's service; do not rely on the obsolete `karabiner_grabber` launchd label.
 
 > Thanks again to pqrs and the Karabiner-Elements community. None of this is novel work on our side — we're just packaging a narrow slice in a different config format.
 
@@ -979,7 +1016,7 @@ the hot path during interactive use is a regression.
 | TCC granted but keys silently swallowed | `tccutil reset ListenEvent com.jackielii.skhd && tccutil reset Accessibility com.jackielii.skhd`, then `skhd --restart-service` and re-grant |
 | `.remap` / `.taphold` does nothing | `skhd --grabber-status` — dext enabled? grabber running? device matched? |
 | Caps lock LED toggles weirdly | `/var/log/skhd-grabber.log`; search for `HIDKeyboardCapsLockDelayOverride` |
-| Karabiner-Elements also installed | `sudo launchctl bootout system/org.pqrs.service.daemon.karabiner_grabber` |
+| Karabiner-Elements also installed | Check the installed Karabiner service and recovery path before switching exclusive keyboard ownership; the old `karabiner_grabber` label may not exist. |
 
 ### Clean slate
 

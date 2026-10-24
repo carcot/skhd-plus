@@ -1,0 +1,168 @@
+f18 : /Applications/YabaiSpaces.app/Contents/MacOS/YabaiIndicator panel activate-selected-or-show
+alt - f19 : /Applications/YabaiSpaces.app/Contents/MacOS/YabaiIndicator window next-in-space
+cmd - f19 : /Applications/YabaiSpaces.app/Contents/MacOS/YabaiIndicator space next-recent
+cmd - 0x2F : /Applications/YabaiSpaces.app/Contents/MacOS/YabaiIndicator space next-recent
+
+.device builtin { vendor: 0x05AC, product: 0x0343 }
+
+.remap caps_lock [device builtin] {
+    tap: f20
+    hold: lcmd
+    timeout: 500ms
+    permissive_hold: off
+    hold_on_other_key_press: on
+}
+
+.remap caps_lock [device builtin] [app "com.apple.Terminal"] {
+    tap: f20
+    hold: rctrl
+    timeout: 500ms
+    permissive_hold: off
+    hold_on_other_key_press: on
+}
+.remap caps_lock [device builtin] [app "com.github.wez.wezterm"] {
+    tap: f20
+    hold: rctrl
+    timeout: 500ms
+    permissive_hold: off
+    hold_on_other_key_press: on
+}
+.remap caps_lock [device builtin] [app "com.googlecode.iterm2"] {
+    tap: f20
+    hold: rctrl
+    timeout: 500ms
+    permissive_hold: off
+    hold_on_other_key_press: on
+}
+.remap caps_lock [device builtin] [app "com.mitchellh.ghostty"] {
+    tap: f20
+    hold: rctrl
+    timeout: 500ms
+    permissive_hold: off
+    hold_on_other_key_press: on
+}
+.remap caps_lock [device builtin] [app "co.zeit.hyperterm"] {
+    tap: f20
+    hold: rctrl
+    timeout: 500ms
+    permissive_hold: off
+    hold_on_other_key_press: on
+}
+.remap caps_lock [device builtin] [app "co.zeit.hyper"] {
+    tap: f20
+    hold: rctrl
+    timeout: 500ms
+    permissive_hold: off
+    hold_on_other_key_press: on
+}
+.remap caps_lock [device builtin] [app "io.alacritty"] {
+    tap: f20
+    hold: rctrl
+    timeout: 500ms
+    permissive_hold: off
+    hold_on_other_key_press: on
+}
+.remap caps_lock [device builtin] [app "net.kovidgoyal.kitty"] {
+    tap: f20
+    hold: rctrl
+    timeout: 500ms
+    permissive_hold: off
+    hold_on_other_key_press: on
+}
+.remap caps_lock [device builtin] [app "dev.carlcotner.ma"] {
+    tap: f20
+    hold: rctrl
+    timeout: 500ms
+    permissive_hold: off
+    hold_on_other_key_press: on
+}
+.remap caps_lock [device builtin] [app "com.apple.ScreenSharing"] {
+    tap: f20
+    hold: rctrl
+    timeout: 500ms
+    permissive_hold: off
+    hold_on_other_key_press: on
+}
+.remap caps_lock [device builtin] [app "org.gnu.Emacs"] : passthrough
+.remap caps_lock [device builtin] [app "org.shirakumo.portacle"] : passthrough
+
+.remap tab [device builtin] [app "com.apple.Terminal"] {
+    tap: tab
+    hold: lctrl
+    timeout: 500ms
+    permissive_hold: off
+    hold_on_other_key_press: on
+}
+.remap tab [device builtin] [app "com.github.wez.wezterm"] {
+    tap: tab
+    hold: lctrl
+    timeout: 500ms
+    permissive_hold: off
+    hold_on_other_key_press: on
+}
+.remap tab [device builtin] [app "com.googlecode.iterm2"] {
+    tap: tab
+    hold: lctrl
+    timeout: 500ms
+    permissive_hold: off
+    hold_on_other_key_press: on
+}
+.remap tab [device builtin] [app "com.mitchellh.ghostty"] {
+    tap: tab
+    hold: lctrl
+    timeout: 500ms
+    permissive_hold: off
+    hold_on_other_key_press: on
+}
+.remap tab [device builtin] [app "co.zeit.hyperterm"] {
+    tap: tab
+    hold: lctrl
+    timeout: 500ms
+    permissive_hold: off
+    hold_on_other_key_press: on
+}
+.remap tab [device builtin] [app "co.zeit.hyper"] {
+    tap: tab
+    hold: lctrl
+    timeout: 500ms
+    permissive_hold: off
+    hold_on_other_key_press: on
+}
+.remap tab [device builtin] [app "io.alacritty"] {
+    tap: tab
+    hold: lctrl
+    timeout: 500ms
+    permissive_hold: off
+    hold_on_other_key_press: on
+}
+.remap tab [device builtin] [app "net.kovidgoyal.kitty"] {
+    tap: tab
+    hold: lctrl
+    timeout: 500ms
+    permissive_hold: off
+    hold_on_other_key_press: on
+}
+
+.remap rcmd [device builtin] {
+    tap: f19
+    tap_modifier: rcmd
+    hold: rcmd
+    timeout: 500ms
+    permissive_hold: off
+    hold_on_other_key_press: on
+}
+.remap rshift [device builtin] {
+    tap: f18
+    hold: rshift
+    timeout: 250ms
+    permissive_hold: off
+    hold_on_other_key_press: on
+}
+.remap ralt [device builtin] {
+    tap: f19
+    tap_modifier: ralt
+    hold: ralt
+    timeout: 500ms
+    permissive_hold: off
+    hold_on_other_key_press: on
+}

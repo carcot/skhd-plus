@@ -61,6 +61,7 @@ pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(arena);
 
     var config_file: ?[]const u8 = null;
+    var grabber_socket_path: ?[]const u8 = null;
     var verbose = false;
     var observe_mode = false;
     var no_hotload = false;
@@ -74,6 +75,14 @@ pub fn main(init: std.process.Init) !void {
                 config_file = args[i];
             } else {
                 std.debug.print("Error: --config requires a file path\n", .{});
+                return;
+            }
+        } else if (std.mem.eql(u8, args[i], "--grabber-socket")) {
+            if (i + 1 < args.len) {
+                i += 1;
+                grabber_socket_path = args[i];
+            } else {
+                std.debug.print("Error: --grabber-socket requires a path\n", .{});
                 return;
             }
         } else if (std.mem.eql(u8, args[i], "-V") or std.mem.eql(u8, args[i], "--verbose")) {
@@ -171,6 +180,11 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
+    if (grabber_socket_path != null and (!verbose or config_file == null)) {
+        std.debug.print("Error: --grabber-socket requires -V and a separate --config file\n", .{});
+        return;
+    }
+
     // Resolve config file path
     const resolved_config_file = if (config_file) |cf|
         try gpa.dupe(u8, cf)
@@ -191,9 +205,10 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
-    // Write PID file
-    try service.writePidFile(gpa, io);
-    defer service.removePidFile(gpa, io);
+    if (!verbose) {
+        try service.writePidFile(gpa, io);
+    }
+    defer if (!verbose) service.removePidFile(gpa, io);
 
     // Capture stderr to ~/Library/Logs/skhd.log when launched as a daemon
     // (SMAppService wires stderr to /dev/null). Skipped for `-V` so verbose
@@ -208,6 +223,7 @@ pub fn main(init: std.process.Init) !void {
     // Initialize and run skhd
     var skhd = try Skhd.init(gpa, io, resolved_config_file, verbose, profile);
     defer skhd.deinit();
+    if (grabber_socket_path) |path| skhd.grabber_socket_path = path;
 
     applyConfigPaths(gpa, skhd.mappings.paths.items);
 
@@ -557,6 +573,8 @@ fn printHelp() void {
         \\
         \\Options:
         \\  -c, --config <file>    Specify config file (default: skhdrc)
+        \\      --grabber-socket <path>
+        \\                         Use a separate grabber socket with -V and -c
         \\  -V, --verbose          Enable verbose output (interactive mode)
         \\  -P, --profile          Enable profiling/tracing mode
         \\  -o, --observe          Observe mode - print key events

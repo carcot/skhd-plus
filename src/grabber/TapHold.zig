@@ -50,6 +50,7 @@ pub const HoldAction = union(enum) {
 pub const Rule = struct {
     src_usage: u16,
     tap_usage: u16,
+    tap_modifier_usage: u16 = 0,
     hold: HoldAction,
     timeout_ms: u32 = 200,
     permissive_hold: bool = false,
@@ -289,8 +290,7 @@ pub fn feed(self: *Self, ev: Event) struct { disposition: Disposition, timer: Ti
                     // action is) without losing it.
                     if (self.rule.retro_tap and !self.other_key_seen) {
                         log.info("retro_tap: no other key seen — emit tap on release", .{});
-                        self.emit(self.rule.tap_usage, true);
-                        self.emit(self.rule.tap_usage, false);
+                        self.emitTap();
                     }
                     self.state = .idle;
                     return .{ .disposition = .consumed, .timer = .none };
@@ -364,11 +364,16 @@ pub fn flushPrefixAndDiscardRest(self: *Self, prefix_len: usize) void {
 
 fn commitTap(self: *Self) void {
     log.debug("commit tap: src=0x{X:0>2} → tap=0x{X:0>2}", .{ self.rule.src_usage, self.rule.tap_usage });
-    self.emit(self.rule.tap_usage, true);
-    self.emit(self.rule.tap_usage, false);
-    // After tap, replay any buffered events in their original order.
+    self.emitTap();
     self.flushBuffer();
     self.state = .idle;
+}
+
+fn emitTap(self: *Self) void {
+    if (self.rule.tap_modifier_usage != 0) self.emit(self.rule.tap_modifier_usage, true);
+    self.emit(self.rule.tap_usage, true);
+    self.emit(self.rule.tap_usage, false);
+    if (self.rule.tap_modifier_usage != 0) self.emit(self.rule.tap_modifier_usage, false);
 }
 
 fn emitHoldDown(self: *Self) void {
@@ -463,6 +468,41 @@ test "tap path: quick source up emits tap_down + tap_up" {
     try std.testing.expectEqual(@as(u32, 0x29), sink.out.items[0].usage);
     try std.testing.expect(sink.out.items[0].pressed);
     try std.testing.expectEqual(@as(u32, 0x29), sink.out.items[1].usage);
+    try std.testing.expect(!sink.out.items[1].pressed);
+}
+
+test "tap modifier wraps tap key and does not affect hold" {
+    var sink = TestSink.init(std.testing.allocator);
+    defer sink.deinit();
+    var eng = init(.{
+        .src_usage = 0xE7,
+        .tap_usage = 0x6E,
+        .tap_modifier_usage = 0xE7,
+        .hold = .{ .hid_usage = 0xE7 },
+    }, TestSink.callback, &sink);
+
+    _ = eng.feed(kbev(0xE7, true));
+    _ = eng.feed(kbev(0xE7, false));
+    const expected = [_]Event{
+        kbev(0xE7, true),
+        kbev(0x6E, true),
+        kbev(0x6E, false),
+        kbev(0xE7, false),
+    };
+    try std.testing.expectEqual(expected.len, sink.out.items.len);
+    for (expected, sink.out.items) |want, actual| {
+        try std.testing.expectEqual(want.usage, actual.usage);
+        try std.testing.expectEqual(want.pressed, actual.pressed);
+    }
+
+    sink.out.clearRetainingCapacity();
+    _ = eng.feed(kbev(0xE7, true));
+    _ = eng.timerFired();
+    _ = eng.feed(kbev(0xE7, false));
+    try std.testing.expectEqual(@as(usize, 2), sink.out.items.len);
+    try std.testing.expectEqual(@as(u32, 0xE7), sink.out.items[0].usage);
+    try std.testing.expect(sink.out.items[0].pressed);
+    try std.testing.expectEqual(@as(u32, 0xE7), sink.out.items[1].usage);
     try std.testing.expect(!sink.out.items[1].pressed);
 }
 

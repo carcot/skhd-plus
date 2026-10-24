@@ -67,7 +67,7 @@ pub const Client = struct {
     /// if the grabber sends back `error` instead.
     pub fn hello(self: *Client) !void {
         try self.send(.{
-            .@"type" = "hello",
+            .type = "hello",
             .uid = currentUid(),
             .version = protocol.protocol_version,
         });
@@ -84,18 +84,24 @@ pub const Client = struct {
         rules: []const protocol.Rule,
         remaps: []const protocol.Remap,
         fkeys_as_standard: bool,
+        app_id: ?[]const u8,
     ) !void {
         try self.send(.{
-            .@"type" = "apply_rules",
+            .type = "apply_rules",
             .rules = rules,
             .remaps = remaps,
             .fkeys_as_standard = fkeys_as_standard,
+            .app_id = app_id,
         });
         try expectOk(self);
     }
 
+    pub fn updateForegroundApp(self: *Client, app_id: ?[]const u8) !void {
+        try self.send(.{ .type = "foreground_app", .app_id = app_id });
+    }
+
     pub fn bye(self: *Client) !void {
-        try self.send(.{ .@"type" = "bye" });
+        try self.send(.{ .type = "bye" });
         // The grabber's response to bye is ok, but we also accept the
         // peer simply closing the socket here.
         expectOk(self) catch |err| switch (err) {

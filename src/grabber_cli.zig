@@ -796,7 +796,6 @@ fn isDextEnabled(allocator: std.mem.Allocator, io: std.Io) ?bool {
     return null;
 }
 
-
 fn launchdServiceRegistered(allocator: std.mem.Allocator, io: std.Io, target: []const u8) !bool {
     const result = std.process.run(allocator, io, .{
         .argv = &.{ "/bin/launchctl", "print", target },
@@ -856,10 +855,11 @@ pub fn readHidDaemonVersion(allocator: std.mem.Allocator, io: std.Io) ?[]const u
     return allocator.dupe(u8, trimmed) catch null;
 }
 
-/// True iff Karabiner-Elements' userland grabber is currently running.
+/// True iff a Karabiner-Elements keyboard-capture service is running.
 /// Coexists badly with skhd-grabber (both seize keyboards via the same
 /// dext), so we surface this as a warning in --install-grabber and --status.
 pub fn isKarabinerElementsActive(allocator: std.mem.Allocator, io: std.Io) bool {
+    if (processRunning(allocator, io, "Karabiner-Core-Service") catch false) return true;
     return processRunning(allocator, io, "karabiner_grabber") catch false;
 }
 
@@ -1204,7 +1204,7 @@ pub fn grabberTestRule(allocator: std.mem.Allocator, io: std.Io, socket_path: []
     defer client.close();
 
     try client.hello();
-    try client.applyRules(&sample_rules, &.{}, false);
+    try client.applyRules(&sample_rules, &.{}, false, null);
     try client.bye();
 
     std.debug.print(

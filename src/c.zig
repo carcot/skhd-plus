@@ -329,6 +329,7 @@ pub const kCGAnnotatedSessionEventTap: CGEventTapLocation = 2;
 pub const kCGHeadInsertEventTap: CGEventTapPlacement = 0;
 // CGEventTapOptions
 pub const kCGEventTapOptionDefault: CGEventTapOptions = 0;
+pub const kCGEventTapOptionListenOnly: CGEventTapOptions = 1;
 // CGEventSourceStateID
 pub const kCGEventSourceStateHIDSystemState: CGEventSourceStateID = 1;
 
@@ -442,6 +443,7 @@ pub const ProcessSerialNumber = extern struct {
 };
 
 pub extern fn GetFrontProcess(pPSN: *ProcessSerialNumber) OSErr;
+pub extern fn GetProcessPID(psn: *const ProcessSerialNumber, pid: *pid_t) OSStatus;
 pub extern fn CopyProcessName(psn: *const ProcessSerialNumber, name: *CFStringRef) OSStatus;
 
 // =====================================================================
@@ -784,6 +786,8 @@ pub const BOOL = i8;
 
 pub extern fn objc_getClass(name: [*:0]const u8) Class;
 pub extern fn sel_registerName(name: [*:0]const u8) SEL;
+pub extern fn objc_autoreleasePoolPush() ?*anyopaque;
+pub extern fn objc_autoreleasePoolPop(token: ?*anyopaque) void;
 
 // =====================================================================
 // Cocoa NSApplicationLoad — needed to wake up Cocoa from a non-bundled
