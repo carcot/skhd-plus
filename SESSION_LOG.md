@@ -1384,9 +1384,10 @@
 ## 2026-11-03: deployed keyboard re-seize retry fix
 
 - Built the patched grabber in ReleaseSafe mode. The `grabber-app` build
-  script could not find its historical `skhd-dev-cert` and attempted to
-  create a self-signed replacement, so that signing run was interrupted.
-  The partially signed staged app was never installed. Re-signed the staged
+  script could not find its historical `skhd-dev-cert` and created a
+  self-signed replacement, so that signing run was interrupted. The unused
+  identity was removed from the login keychain afterward. The partially
+  signed staged app was never installed. Re-signed the staged
   binary and bundle manually with the same Apple Development identity,
   bundle identifier, and designated requirement as the installed app.
   Strict/deep signature verification passed. A non-opening match probe
