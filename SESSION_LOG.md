@@ -1334,3 +1334,75 @@
 - Validation: documentation code fences and relative links checked, YAML
   parsed, `git diff --check` passed. No keyboard services or source binaries
   changed; no physical-input test was part of this documentation-only update.
+
+## 2026-11-02: missed keyboard re-seize after device re-enumeration
+
+- The user reported normal typing but native Caps Lock and failed Right
+  Command, Right Option, and Right Shift taps after a high-level skhd
+  restart. The high-level daemon's event tap was active; the separate
+  remap agent and grabber processes and IPC socket were healthy, so those
+  checks alone did not establish that a keyboard was seized.
+- The root grabber log showed a keyboard termination at 18:28:17, an
+  attempted rebuild matching zero devices, and
+  `AppScopedRequiresSingleKeyboard`. Subsequent keyboard-matched
+  notifications were logged, but `onDeviceChange` returned whenever
+  `seize == null`, preventing a retry after that transient failure.
+- A guarded restart of only the remap agent re-forwarded 24 rules and
+  the grabber logged `matched_count=1`. The independent five-minute
+  safety job fired before the user confirmed physical-key behavior,
+  restored Karabiner's user agents, and disabled the remap agent and
+  grabber. The submitted safety job unexpectedly restarted once; it
+  was explicitly removed and verified absent. Do not use the same
+  `launchctl submit` pattern as a one-shot timer again.
+- Changed the source callback to retry device changes when there is an
+  active subscription even if the previous seize failed. This source
+  change is not installed or physically tested. Zig 0.16.0 `fmt --check`
+  and ReleaseSafe build passed with a temporary global cache. The live
+  keyboard remains on the tested Karabiner rollback state pending user
+  confirmation and a separately guarded cutover.
+
+## 2026-11-03: restored skhd keyboard ownership after guarded test
+
+- The user's delayed test response confirmed that Caps Lock, Right Command,
+  Right Option, Right Shift, and typing worked after the remap-agent restart;
+  the five-minute timer had already restored Karabiner before that response.
+- Rechecked Karabiner's two user agents running and the skhd remap agent and
+  grabber disabled. Prepared and linted a root-owned, 15-minute rollback
+  launchd job with `LaunchOnlyOnce=true`, `KeepAlive=false`, and the tested
+  `/usr/local/sbin/skhd-restore-karabiner` script. Verified it running once
+  before switching keyboard ownership.
+- Disabled and unregistered only Karabiner's two user agents, then enabled
+  and bootstrapped the existing skhd grabber and remap agent. The agent
+  acknowledged forwarding all 24 tap-hold rules. The user confirmed normal
+  typing and working Caps Lock, Right Command, Right Option, and Right Shift,
+  with no doubled, missing, or stuck keys.
+- Canceled the rollback and verified its launchd job absent. Verified both
+  skhd remap jobs and the ordinary high-level skhd job running, with the
+  Karabiner user agents absent and disabled. The source retry fix above
+  was still uninstalled at this point.
+
+## 2026-11-03: deployed keyboard re-seize retry fix
+
+- Built the patched grabber in ReleaseSafe mode. The `grabber-app` build
+  script could not find its historical `skhd-dev-cert` and attempted to
+  create a self-signed replacement, so that signing run was interrupted.
+  The partially signed staged app was never installed. Re-signed the staged
+  binary and bundle manually with the same Apple Development identity,
+  bundle identifier, and designated requirement as the installed app.
+  Strict/deep signature verification passed. A non-opening match probe
+  found the built-in keyboard.
+- Copied and hash-verified the previously working installed bundle into
+  root-owned private temporary storage. Armed and verified a fresh
+  15-minute, one-shot Karabiner rollback before replacing only
+  `/Applications/skhd-grabber-dev.app`. The ordinary skhd service, remap
+  agent, and rule configuration were unchanged.
+- Restarted the grabber. Its new process was running, its installed binary
+  hash matched the staged build, its signature passed strict/deep checks,
+  and the remap agent reconnected and forwarded all 24 rules. The user
+  confirmed normal typing and working Caps Lock, Right Command, Right
+  Option, and Right Shift, without doubled, missing, or stuck keys.
+- Canceled the rollback and verified it absent. Confirmed the grabber,
+  remap agent, and high-level skhd running with Karabiner's two user agents
+  disabled. The physical test establishes ordinary behavior after restart;
+  it does not yet reproduce a device disappearing and reappearing, so that
+  specific retry path remains untested on physical hardware.

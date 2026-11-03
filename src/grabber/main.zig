@@ -1318,7 +1318,7 @@ fn consoleUserTimerCallback(_: c.CFRunLoopTimerRef, info: ?*anyopaque) callconv(
 fn onDeviceChange(ctx: ?*anyopaque) void {
     const d: *Daemon = @ptrCast(@alignCast(ctx orelse return));
     if (d.sleeping) return; // seize stays released until wake
-    if (d.seize == null) return; // nothing seized yet → first apply_rules will
+    if (d.seize == null and d.activeSubscription() == null) return;
     // info: routine recovery, fires on every wake/plug — compiled out of
     // ReleaseFast. The FAILURE below stays warn (a real anomaly).
     log.info("keyboard enumeration changed — re-seizing", .{});
