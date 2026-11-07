@@ -1407,3 +1407,40 @@
   disabled. The physical test establishes ordinary behavior after restart;
   it does not yet reproduce a device disappearing and reappearing, so that
   specific retry path remains untested on physical hardware.
+
+## 2026-11-07: restore ordinary hotkeys after signing and service failure
+
+- The user reported skhd stopped working again. The separate remap agent
+  (PID 62578), root grabber (PID 63481), and custom IPC socket were still
+  running; the ordinary `com.jackielii.skhd` hotkey job was absent. The
+  installed 0.2.3-70b0ebe app had been replaced at 01:28 with a build
+  signed by `skhd-pr62-cert`, with no Apple Team ID. `--start-service`
+  registered its job, but macOS rejected launch with
+  `OS_REASON_CODESIGNING / Launch Constraint Violation`. `amfid` called
+  its signing chain unknown. A strict `codesign --verify` result alone did
+  not establish that this background job could launch.
+- Backed up the exact installed app to
+  `/private/tmp/skhd-recovery-20261107/before-skhd.app`, staged an identical
+  copy, and signed its helper, main binary, and wrapper with the existing
+  Apple Development identity (team `7CJ3BM3AGT`). Strict/deep verification,
+  matching installed/candidate binary hashes, and version 0.2.3 passed.
+  Retired the self-signed app under the same recovery directory and installed
+  the repaired copy at `/Applications/skhd.app`.
+- Re-registering the bundled `SMAppService` agent still produced a launch
+  constraint violation. `sfltool dumpbtm` showed an older background-item
+  parent entry for `com.jackielii.skhd` without a Team ID and an enabled
+  child agent with team `7CJ3BM3AGT`; stale parent metadata is a plausible
+  explanation, not a proven cause. Launch Services registration did not
+  update that parent entry. No global `resetbtm` or reboot was done.
+- Unregistered only the failing bundled agent. Installed a validated user
+  LaunchAgent at `~/Library/LaunchAgents/com.jackielii.skhd.plist` with the
+  same label and `/Applications/skhd.app/Contents/MacOS/skhd` executable.
+  `launchctl` showed one running high-level job (PID 94618); skhd reported
+  an active hotkey event tap and Input Monitoring granted. The user
+  confirmed a regular shortcut, tap actions, and ordinary typing work.
+  The low-level remap agent and grabber retained their original PIDs.
+- The CLI's `Service installed: No` refers specifically to its bundled
+  `SMAppService` registration; it does not detect this working user
+  LaunchAgent. Do not run `--start-service` alongside the manual job or
+  replace the app with a self-signed build. The login-time restart is
+  configured but has not yet been tested by logging out or rebooting.
